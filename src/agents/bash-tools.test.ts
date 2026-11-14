@@ -1,397 +1,425 @@
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core/expect";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import type { SessionEventReceipt } from "../auto-reply/reply/session-event-contract.js";
+import * as sessionEvents from "../auto-reply/reply/session-event-handoff.js";
+import { drainFormattedSystemEvents } from "../auto-reply/reply/session-system-events.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
+import { writeSessionEntry } from "../config/sessions/session-accessor.sqlite-entry-store.js";
+import {
+  peekSystemEventEntries,
+  peekSystemEvents,
+  resetSystemEventsForTest,
+} from "../infra/system-events.js";
+import * as gatewayWork from "../process/gateway-work-admission.js";
+import type { SpawnInput } from "../process/supervisor/types.js";
+import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+import {
+  createOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
+import { createOpenClawCodingTools } from "./agent-tools.js";
+import { getFinishedSession, waitForExecScope } from "./bash-process-registry.js";
+import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
+import * as supervisorExit from "./bash-tools.exec-runtime.test-support.js";
+import { createExecTool, createProcessTool } from "./bash-tools.js";
+import { fullGatewayExec, runningSession } from "./bash-tools.lifecycle.test-support.js";
+import { getBashShellConfig } from "./shell-utils.js";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { peekSystemEvents, resetSystemEventsForTest } from "../infra/system-events.js";
-import { getFinishedSession, resetProcessRegistryForTests } from "./bash-process-registry.js";
-import { createExecTool, createProcessTool, execTool, processTool } from "./bash-tools.js";
-import { buildDockerExecArgs } from "./bash-tools.shared.js";
-import { sanitizeBinaryOutput } from "./shell-utils.js";
+// mock-isolation: Hold normal follow-up admission so factory tests can inspect exact queued routing.
+vi.mock("../auto-reply/dispatch.js", async () => {
+  const { createDeferredExecDispatchMock } =
+    await import("./bash-tools.exec-runtime.test-support.js");
+  return createDeferredExecDispatchMock();
+});
+
+vi.mock("../infra/channel-summary.js", () => ({
+  buildChannelSummary: vi.fn(async () => []),
+}));
+
+vi.mock("./bash-tools.exec-approval-followup.js", () => ({
+  sendExecApprovalFollowup: vi.fn(async () => false),
+}));
+
+vi.mock("./tools/gateway.js", () => ({
+  callGatewayTool: vi.fn(async () => ({ ok: true })),
+  readGatewayCallOptions: vi.fn(() => ({})),
+}));
+
+vi.mock("../infra/shell-env.js", async () => {
+  return {
+    ...(await vi.importActual<typeof import("../infra/shell-env.js")>("../infra/shell-env.js")),
+    getShellPathFromLoginShell: vi.fn(() => null),
+    resolveShellEnvFallbackTimeoutMs: vi.fn(() => 0),
+  };
+});
+
+// mock-isolation: Simulate process output and settlement without launching host commands.
+vi.mock("../process/supervisor/index.js", async () => {
+  const { takeHeldSupervisorExit, createRunExit } =
+    await import("./bash-tools.exec-runtime.test-support.js");
+  const { setImmediate: immediate } = await import("node:timers/promises");
+  const splitCommands = (command: string) =>
+    command
+      .split(";")
+      .map((part) => part.trim())
+      .filter(Boolean);
+  const commandOutput = (command: string, env?: NodeJS.ProcessEnv) => {
+    const shellEnv = { ...env };
+    const pathKey = "Path" in shellEnv && !("PATH" in shellEnv) ? "Path" : "PATH";
+    return splitCommands(command)
+      .map((segment) => {
+        if (segment === 'export PATH="${OPENCLAW_PREPEND_PATH}${PATH:+:$PATH}"') {
+          const current = shellEnv[pathKey];
+          shellEnv[pathKey] =
+            `${shellEnv.OPENCLAW_PREPEND_PATH ?? ""}${current ? `:${current}` : ""}`;
+        } else if (segment === "unset OPENCLAW_PREPEND_PATH") {
+          delete shellEnv.OPENCLAW_PREPEND_PATH;
+        }
+        if (segment === "echo $PATH" || segment === "Write-Output $env:PATH") {
+          return `${shellEnv[pathKey] ?? ""}\n`;
+        }
+        const prefix = ["echo ", "Write-Output "].find((value) => segment.startsWith(value));
+        return prefix ? `${segment.slice(prefix.length)}\n` : "";
+      })
+      .join("");
+  };
+
+  return {
+    getProcessSupervisor: () => ({
+      spawn: async (input: Partial<Extract<SpawnInput, { mode: "child" }>>) => {
+        const exitGate = takeHeldSupervisorExit();
+        const command = input.argv?.at(-1) ?? "";
+        const output = commandOutput(command, input.env);
+        const exitCode = splitCommands(command).includes("exit 1") ? 1 : 0;
+        const stagedOutput = command.includes("after")
+          ? output.replace(/after[^\n]*\n?/gu, "")
+          : output;
+        const deferredOutput = output.slice(stagedOutput.length);
+        if (stagedOutput) {
+          input.onStdout?.(stagedOutput);
+        }
+        const activity = { resultSettled: false, lastOutputAtMs: Date.now() };
+        return {
+          activity,
+          runId: "mock-bash-run",
+          startedAtMs: Date.now(),
+          pid: 123,
+          stdin: undefined,
+          wait: async () => {
+            if (exitGate) {
+              exitGate.markStarted();
+              await exitGate.wait;
+            } else {
+              await immediate();
+              await immediate();
+            }
+            if (deferredOutput) {
+              input.onStdout?.(deferredOutput);
+              activity.lastOutputAtMs = Date.now();
+            }
+            activity.resultSettled = true;
+            return createRunExit({ exitCode, durationMs: 0 });
+          },
+          cancel: vi.fn(),
+        };
+      },
+      cancel: vi.fn(),
+      cancelScope: vi.fn(),
+    }),
+  };
+});
 
 const isWin = process.platform === "win32";
-// PowerShell: Start-Sleep for delays, ; for command separation, $null for null device
-const shortDelayCmd = isWin ? "Start-Sleep -Milliseconds 50" : "sleep 0.05";
-const yieldDelayCmd = isWin ? "Start-Sleep -Milliseconds 200" : "sleep 0.2";
-const longDelayCmd = isWin ? "Start-Sleep -Seconds 2" : "sleep 2";
-// Both PowerShell and bash use ; for command separation
-const joinCommands = (commands: string[]) => commands.join("; ");
-const echoAfterDelay = (message: string) => joinCommands([shortDelayCmd, `echo ${message}`]);
-const echoLines = (lines: string[]) => joinCommands(lines.map((line) => `echo ${line}`));
-const normalizeText = (value?: string) =>
-  sanitizeBinaryOutput(value ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .map((line) => line.replace(/\s+$/u, ""))
-    .join("\n")
-    .trim();
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function waitForCompletion(sessionId: string) {
-  let status = "running";
-  const deadline = Date.now() + (process.platform === "win32" ? 8000 : 2000);
-  while (Date.now() < deadline && status === "running") {
-    const poll = await processTool.execute("call-wait", {
-      action: "poll",
-      sessionId,
-    });
-    status = (poll.details as { status: string }).status;
-    if (status === "running") {
-      await sleep(20);
-    }
-  }
-  return status;
-}
+const defaultShell = isWin
+  ? undefined
+  : process.env.OPENCLAW_TEST_SHELL || getBashShellConfig().shell;
+const scopeKey = "test:bash-tools";
+const sessionKey = "agent:main:main";
+const shellEcho = (text: string) => (isWin ? `Write-Output ${text}` : `echo ${text}`);
+const echoSequence = (...values: string[]) => values.map(shellEcho).join("; ");
+const createTool = (defaults?: Parameters<typeof createExecTool>[0]) =>
+  createExecTool({
+    ...fullGatewayExec,
+    bypassHostApprovalFloors: true,
+    scopeKey,
+    ...defaults,
+  });
+const processTool = createProcessTool();
+const text = (result: { content: Array<{ type: string; text?: string }> }) =>
+  result.content.find((part) => part.type === "text")?.text?.trim() ?? "";
+let callId = 0;
+type ExecOptions = Omit<Parameters<ReturnType<typeof createExecTool>["execute"]>[1], "command">;
+const execute = (
+  tool: ReturnType<typeof createExecTool>,
+  command: string,
+  options: ExecOptions = {},
+) => tool.execute(`call-${++callId}`, { command, ...options });
+const processAction = (args: Parameters<typeof processTool.execute>[1]) =>
+  processTool.execute(`call-${++callId}`, args);
+const startBackground = async (tool: ReturnType<typeof createExecTool>, command: string) =>
+  runningSession((await execute(tool, command, { background: true })).details).sessionId;
+const notifyTool = (defaults?: Parameters<typeof createExecTool>[0]) =>
+  createTool({
+    backgroundMs: 0,
+    notifyOnExit: true,
+    sessionKey,
+    ...defaults,
+  });
+const heldExit = <T>(
+  run: (exit: Pick<supervisorExit.HeldSupervisorExit, "waitStarted">) => Promise<T>,
+) => supervisorExit.withHeldSupervisorExit(run, () => waitForExecScope(scopeKey));
+const startAndFinish = async (tool: ReturnType<typeof createExecTool>, command: string) => {
+  const id = await startBackground(tool, command);
+  await waitForExecScope(scopeKey);
+  return id;
+};
 
 beforeEach(() => {
+  callId = 0;
   resetProcessRegistryForTests();
   resetSystemEventsForTest();
+  vi.stubEnv("OPENCLAW_EXEC_SHELL_SNAPSHOT", "0");
+  if (defaultShell) {
+    vi.stubEnv("SHELL", defaultShell);
+  }
+});
+afterEach(async () => {
+  await waitForExecScope(scopeKey);
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 
-describe("exec tool backgrounding", () => {
-  const originalShell = process.env.SHELL;
-
-  beforeEach(() => {
-    if (!isWin) process.env.SHELL = "/bin/bash";
-  });
-
-  afterEach(() => {
-    if (!isWin) process.env.SHELL = originalShell;
-  });
-
-  it(
-    "backgrounds after yield and can be polled",
-    async () => {
-      const result = await execTool.execute("call1", {
-        command: joinCommands([yieldDelayCmd, "echo done"]),
+it("yields a pollable process and releases foreground callbacks", async () => {
+  const onUpdate = vi.fn();
+  const abort = new AbortController();
+  const addListener = vi.spyOn(abort.signal, "addEventListener");
+  const removeListener = vi.spyOn(abort.signal, "removeEventListener");
+  const tool = createTool();
+  const id = await heldExit(async (exit) => {
+    const execution = tool.execute(
+      "yield",
+      {
+        command: echoSequence("before", "after"),
         yieldMs: 10,
-      });
-
-      expect(result.details.status).toBe("running");
-      const sessionId = (result.details as { sessionId: string }).sessionId;
-
-      let status = "running";
-      let output = "";
-      const deadline = Date.now() + (process.platform === "win32" ? 8000 : 2000);
-
-      while (Date.now() < deadline && status === "running") {
-        const poll = await processTool.execute("call2", {
-          action: "poll",
-          sessionId,
-        });
-        status = (poll.details as { status: string }).status;
-        const textBlock = poll.content.find((c) => c.type === "text");
-        output = textBlock?.text ?? "";
-        if (status === "running") {
-          await sleep(20);
-        }
-      }
-
-      expect(status).toBe("completed");
-      expect(output).toContain("done");
-    },
-    isWin ? 15_000 : 5_000,
-  );
-
-  it("supports explicit background", async () => {
-    const result = await execTool.execute("call1", {
-      command: echoAfterDelay("later"),
-      background: true,
-    });
-
-    expect(result.details.status).toBe("running");
-    const sessionId = (result.details as { sessionId: string }).sessionId;
-
-    const list = await processTool.execute("call2", { action: "list" });
-    const sessions = (list.details as { sessions: Array<{ sessionId: string }> }).sessions;
-    expect(sessions.some((s) => s.sessionId === sessionId)).toBe(true);
-  });
-
-  it("derives a session name from the command", async () => {
-    const result = await execTool.execute("call1", {
-      command: "echo hello",
-      background: true,
-    });
-    const sessionId = (result.details as { sessionId: string }).sessionId;
-    await sleep(25);
-
-    const list = await processTool.execute("call2", { action: "list" });
-    const sessions = (list.details as { sessions: Array<{ sessionId: string; name?: string }> })
-      .sessions;
-    const entry = sessions.find((s) => s.sessionId === sessionId);
-    expect(entry?.name).toBe("echo hello");
-  });
-
-  it("uses default timeout when timeout is omitted", async () => {
-    const customBash = createExecTool({ timeoutSec: 1, backgroundMs: 10 });
-    const customProcess = createProcessTool();
-
-    const result = await customBash.execute("call1", {
-      command: longDelayCmd,
-      background: true,
-    });
-
-    const sessionId = (result.details as { sessionId: string }).sessionId;
-    let status = "running";
-    const deadline = Date.now() + 5000;
-
-    while (Date.now() < deadline && status === "running") {
-      const poll = await customProcess.execute("call2", {
-        action: "poll",
-        sessionId,
-      });
-      status = (poll.details as { status: string }).status;
-      if (status === "running") {
-        await sleep(50);
-      }
-    }
-
-    expect(status).toBe("failed");
-  });
-
-  it("rejects elevated requests when not allowed", async () => {
-    const customBash = createExecTool({
-      elevated: { enabled: true, allowed: false, defaultLevel: "off" },
-      messageProvider: "telegram",
-      sessionKey: "agent:main:main",
-    });
-
-    await expect(
-      customBash.execute("call1", {
-        command: "echo hi",
-        elevated: true,
-      }),
-    ).rejects.toThrow("Context: provider=telegram session=agent:main:main");
-  });
-
-  it("does not default to elevated when not allowed", async () => {
-    const customBash = createExecTool({
-      elevated: { enabled: true, allowed: false, defaultLevel: "on" },
-      backgroundMs: 1000,
-      timeoutSec: 5,
-    });
-
-    const result = await customBash.execute("call1", {
-      command: "echo hi",
-    });
-    const text = result.content.find((c) => c.type === "text")?.text ?? "";
-    expect(text).toContain("hi");
-  });
-
-  it("logs line-based slices and defaults to last lines", async () => {
-    const result = await execTool.execute("call1", {
-      command: echoLines(["one", "two", "three"]),
-      background: true,
-    });
-    const sessionId = (result.details as { sessionId: string }).sessionId;
-
-    const status = await waitForCompletion(sessionId);
-
-    const log = await processTool.execute("call3", {
-      action: "log",
-      sessionId,
-      limit: 2,
-    });
-    const textBlock = log.content.find((c) => c.type === "text");
-    expect(normalizeText(textBlock?.text)).toBe("two\nthree");
-    expect((log.details as { totalLines?: number }).totalLines).toBe(3);
-    expect(status).toBe("completed");
-  });
-
-  it("supports line offsets for log slices", async () => {
-    const result = await execTool.execute("call1", {
-      command: echoLines(["alpha", "beta", "gamma"]),
-      background: true,
-    });
-    const sessionId = (result.details as { sessionId: string }).sessionId;
-    await waitForCompletion(sessionId);
-
-    const log = await processTool.execute("call2", {
-      action: "log",
-      sessionId,
-      offset: 1,
-      limit: 1,
-    });
-    const textBlock = log.content.find((c) => c.type === "text");
-    expect(normalizeText(textBlock?.text)).toBe("beta");
-  });
-
-  it("scopes process sessions by scopeKey", async () => {
-    const bashA = createExecTool({ backgroundMs: 10, scopeKey: "agent:alpha" });
-    const processA = createProcessTool({ scopeKey: "agent:alpha" });
-    const bashB = createExecTool({ backgroundMs: 10, scopeKey: "agent:beta" });
-    const processB = createProcessTool({ scopeKey: "agent:beta" });
-
-    const resultA = await bashA.execute("call1", {
-      command: shortDelayCmd,
-      background: true,
-    });
-    const resultB = await bashB.execute("call2", {
-      command: shortDelayCmd,
-      background: true,
-    });
-
-    const sessionA = (resultA.details as { sessionId: string }).sessionId;
-    const sessionB = (resultB.details as { sessionId: string }).sessionId;
-
-    const listA = await processA.execute("call3", { action: "list" });
-    const sessionsA = (listA.details as { sessions: Array<{ sessionId: string }> }).sessions;
-    expect(sessionsA.some((s) => s.sessionId === sessionA)).toBe(true);
-    expect(sessionsA.some((s) => s.sessionId === sessionB)).toBe(false);
-
-    const pollB = await processB.execute("call4", {
-      action: "poll",
-      sessionId: sessionA,
-    });
-    expect(pollB.details.status).toBe("failed");
-  });
-});
-
-describe("exec notifyOnExit", () => {
-  it("enqueues a system event when a backgrounded exec exits", async () => {
-    const tool = createExecTool({
-      allowBackground: true,
-      backgroundMs: 0,
-      notifyOnExit: true,
-      sessionKey: "agent:main:main",
-    });
-
-    const result = await tool.execute("call1", {
-      command: echoAfterDelay("notify"),
-      background: true,
-    });
-
-    expect(result.details.status).toBe("running");
-    const sessionId = (result.details as { sessionId: string }).sessionId;
-
-    let finished = getFinishedSession(sessionId);
-    const deadline = Date.now() + (isWin ? 8000 : 2000);
-    while (!finished && Date.now() < deadline) {
-      await sleep(20);
-      finished = getFinishedSession(sessionId);
-    }
-
-    expect(finished).toBeTruthy();
-    const events = peekSystemEvents("agent:main:main");
-    expect(events.some((event) => event.includes(sessionId.slice(0, 8)))).toBe(true);
-  });
-});
-
-describe("exec PATH handling", () => {
-  const originalPath = process.env.PATH;
-  const originalShell = process.env.SHELL;
-
-  beforeEach(() => {
-    if (!isWin) process.env.SHELL = "/bin/bash";
-  });
-
-  afterEach(() => {
-    process.env.PATH = originalPath;
-    if (!isWin) process.env.SHELL = originalShell;
-  });
-
-  it("prepends configured path entries", async () => {
-    const basePath = isWin ? "C:\\Windows\\System32" : "/usr/bin";
-    const prepend = isWin ? ["C:\\custom\\bin", "C:\\oss\\bin"] : ["/custom/bin", "/opt/oss/bin"];
-    process.env.PATH = basePath;
-
-    const tool = createExecTool({ pathPrepend: prepend });
-    const result = await tool.execute("call1", {
-      command: isWin ? "Write-Output $env:PATH" : "echo $PATH",
-    });
-
-    const text = normalizeText(result.content.find((c) => c.type === "text")?.text);
-    expect(text).toBe([...prepend, basePath].join(path.delimiter));
-  });
-});
-
-describe("buildDockerExecArgs", () => {
-  it("prepends custom PATH after login shell sourcing to preserve both custom and system tools", () => {
-    const args = buildDockerExecArgs({
-      containerName: "test-container",
-      command: "echo hello",
-      env: {
-        PATH: "/custom/bin:/usr/local/bin:/usr/bin",
-        HOME: "/home/user",
       },
-      tty: false,
-    });
+      abort.signal,
+      onUpdate,
+    );
+    await Promise.race([exit.waitStarted, execution]);
+    await vi.advanceTimersByTimeAsync(10);
+    const runningSessionId = runningSession((await execution).details).sessionId;
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+    const listener = addListener.mock.calls.find(([type]) => type === "abort")?.[1];
+    expect(listener).toBeDefined();
+    expect(removeListener).toHaveBeenCalledWith("abort", listener);
+    return runningSessionId;
+  });
+  expect(onUpdate).toHaveBeenCalledTimes(1);
+  const poll = await processAction({ action: "poll", sessionId: id });
+  expect(poll.details).toMatchObject({ status: "completed" });
+  expect(text(poll)).toContain("before\nafter");
+});
 
-    const commandArg = args[args.length - 1];
-    expect(args).toContain("CLAWDBOT_PREPEND_PATH=/custom/bin:/usr/local/bin:/usr/bin");
-    expect(commandArg).toContain('export PATH="${CLAWDBOT_PREPEND_PATH}:$PATH"');
-    expect(commandArg).toContain("echo hello");
-    expect(commandArg).toBe(
-      'export PATH="${CLAWDBOT_PREPEND_PATH}:$PATH"; unset CLAWDBOT_PREPEND_PATH; echo hello',
+it("awaits terminal shell results past the yield window without enabling notifications", async () => {
+  const tool = createTool({ notifyOnExit: false, sessionKey });
+  let execution: ReturnType<typeof execute> | undefined;
+  let settled = false;
+  await heldExit(async (exit) => {
+    execution = execute(tool, echoSequence("before", "after"), {
+      awaitResults: true,
+      yieldMs: 10,
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+    await Promise.race([exit.waitStarted, execution]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(settled).toBe(false);
+  });
+  await expect(execution).resolves.toMatchObject({
+    details: { status: "completed", exitCode: 0, aggregated: "before\nafter" },
+  });
+  expect(peekSystemEvents(sessionKey)).toEqual([]);
+  await expect(
+    execute(tool, shellEcho("detached"), { awaitResults: true, background: true }),
+  ).rejects.toThrow("cannot be detached");
+});
+
+it("rejects elevated requests when not allowed", async () => {
+  const tool = createTool({
+    elevated: { enabled: true, allowed: false, defaultLevel: "off" },
+    messageProvider: "telegram",
+    sessionKey,
+  });
+  await expect(execute(tool, shellEcho("hi"), { elevated: true })).rejects.toThrow(
+    "Context: provider=telegram session=agent:main:main",
+  );
+});
+
+it("does not default to elevated when not allowed", async () => {
+  const tool = createTool({
+    elevated: { enabled: true, allowed: false, defaultLevel: "on" },
+    backgroundMs: 1000,
+    timeoutSec: 5,
+  });
+  expect(text(await execute(tool, shellEcho("hi")))).toContain("hi");
+});
+
+it("reads the unbounded offset and clamped tail log windows", async () => {
+  const sessionId = await startAndFinish(
+    createTool(),
+    Array.from({ length: 201 }, (_, i) => shellEcho(`line-${i + 1}`)).join("; "),
+  );
+  const log = await processAction({ action: "log", sessionId, offset: 30 });
+  expect(text(await processAction({ action: "log", sessionId, limit: -5 }))).toMatch(/^line-201\n/);
+  expect(text(log).split("\n")[0]).toBe("line-31");
+  expect(text(log)).toMatch(/line-201\n\nProcess exited with code 0\.$/);
+  expect(text(log)).not.toContain("showing last 200");
+});
+
+describe("background completion notifications", () => {
+  let state: OpenClawTestState;
+  let continuation: MockInstance<typeof gatewayWork.runWithGatewayDetachedWorkContinuation>;
+  let receipts: SessionEventReceipt[];
+  beforeEach(async () => {
+    receipts = [];
+    continuation = vi.spyOn(gatewayWork, "runWithGatewayDetachedWorkContinuation");
+    const enqueue = sessionEvents.enqueueSessionEventForHost;
+    vi.spyOn(sessionEvents, "enqueueSessionEventForHost").mockImplementation(
+      (eventText, options) => {
+        const receipt = enqueue(eventText, options);
+        receipts.push(receipt);
+        return receipt;
+      },
+    );
+    state = await createOpenClawTestState({ layout: "state-only", prefix: "bash-notify-route-" });
+    setRuntimeConfigSnapshot({ agents: { entries: { main: {} } } });
+    openOpenClawStateDatabase({ env: state.env });
+    writeSessionEntry(openOpenClawAgentDatabase({ agentId: "main", env: state.env }), sessionKey, {
+      sessionId: "bash-origin",
+      lifecycleRevision: "original-revision",
+      updatedAt: Date.now(),
+    });
+  });
+  afterEach(async () => {
+    resetSystemEventsForTest();
+    await Promise.allSettled(receipts.map((receipt) => receipt.settled));
+    await Promise.allSettled(
+      continuation.mock.results.flatMap((result) =>
+        result.type === "return" ? [result.value] : [],
+      ),
+    );
+    clearRuntimeConfigSnapshot();
+    await state.cleanup();
+  });
+
+  it("delivers an assembled exec completion to the conversation's auto-thread", async () => {
+    const exec = expectDefined(
+      createOpenClawCodingTools({
+        sessionKey,
+        messageProvider: "discord",
+        currentChannelId: "channel:111",
+        currentMessagingTarget: "channel:222",
+        exec: { ...fullGatewayExec, bypassHostApprovalFloors: true, scopeKey },
+      }).find((tool) => tool.name === "exec"),
+      "assembled exec tool",
+    );
+    const result = await exec.execute("auto-thread", {
+      command: shellEcho("thread-result"),
+      background: true,
+    });
+    expect(result.details).toMatchObject({ status: "running" });
+    await waitForExecScope(scopeKey);
+    const receipt = expectDefined(receipts[0], "completion receipt");
+    await expect(receipt.accepted).resolves.toEqual({ ok: true });
+    expect(peekSystemEventEntries(sessionKey)).toContainEqual(
+      expect.objectContaining({
+        id: receipt.id,
+        deliveryContext: expect.objectContaining({ channel: "discord", to: "channel:222" }),
+      }),
     );
   });
 
-  it("does not interpolate PATH into the shell command", () => {
-    const injectedPath = "$(touch /tmp/clawdbot-path-injection)";
-    const args = buildDockerExecArgs({
-      containerName: "test-container",
-      command: "echo hello",
-      env: {
-        PATH: injectedPath,
-        HOME: "/home/user",
-      },
-      tty: false,
-    });
-
-    const commandArg = args[args.length - 1];
-    expect(args).toContain(`CLAWDBOT_PREPEND_PATH=${injectedPath}`);
-    expect(commandArg).not.toContain(injectedPath);
-    expect(commandArg).toContain("CLAWDBOT_PREPEND_PATH");
+  it.each([
+    {
+      name: "defaults to notifying chat providers",
+      notifyOnExitEmptySuccess: undefined,
+      emits: true,
+    },
+    { name: "honors an explicit silent override", notifyOnExitEmptySuccess: false, emits: false },
+  ])("$name on empty success", async ({ notifyOnExitEmptySuccess, emits }) => {
+    const id = await startAndFinish(
+      notifyTool({
+        messageProvider: " Telegram ",
+        currentChannelId: "telegram:-100123:topic:47",
+        currentThreadTs: "47",
+        notifyOnExitEmptySuccess,
+      }),
+      isWin ? "$null" : ":",
+    );
+    expect(getFinishedSession(id)).toMatchObject({ id, terminalStatus: "completed", exitCode: 0 });
+    expect(receipts).toHaveLength(emits ? 1 : 0);
+    if (emits) {
+      const receipt = expectDefined(receipts[0], "completion receipt");
+      await expect(receipt.accepted).resolves.toEqual({ ok: true });
+      expect(peekSystemEventEntries(sessionKey)).toContainEqual(
+        expect.objectContaining({
+          id: receipt.id,
+          contextKey: `exec:${id}`,
+          deliveryContext: {
+            channel: "telegram",
+            to: "telegram:-100123:topic:47",
+            threadId: "47",
+            accountId: undefined,
+          },
+        }),
+      );
+      expect(
+        await drainFormattedSystemEvents({
+          cfg: {},
+          agentId: "main",
+          sessionKey,
+          isMainSession: false,
+          isNewSession: false,
+        }),
+      ).toBeUndefined();
+    }
+    expect(peekSystemEvents(sessionKey)).toEqual(
+      emits ? [`Exec completed (${id.slice(0, 8)}, code 0)`] : [],
+    );
   });
+});
 
-  it("does not add PATH export when PATH is not in env", () => {
-    const args = buildDockerExecArgs({
-      containerName: "test-container",
-      command: "echo hello",
-      env: {
-        HOME: "/home/user",
-      },
-      tty: false,
-    });
+it("prepends configured PATH entries ahead of existing shell paths", async () => {
+  const existing = isWin ? ["C:\\evil\\bin", "C:\\Windows\\System32"] : ["/evil/bin", "/usr/bin"];
+  const prepend = isWin ? ["C:\\custom\\bin", "C:\\oss\\bin"] : ["/custom/bin", "/opt/oss/bin"];
+  vi.stubEnv("PATH", existing.join(path.delimiter));
+  const result = await execute(
+    createTool({ pathPrepend: prepend }),
+    isWin ? "Write-Output $env:PATH" : "echo $PATH",
+  );
+  expect(text(result).split(path.delimiter)).toEqual([...prepend, ...existing]);
+});
 
-    const commandArg = args[args.length - 1];
-    expect(commandArg).toBe("echo hello");
-    expect(commandArg).not.toContain("export PATH");
+it("suppresses onUpdate after abort signal fires", async () => {
+  const abort = new AbortController();
+  const onUpdate = vi.fn(() => abort.abort());
+  await expect(
+    createTool().execute(
+      "abort",
+      { command: echoSequence("before-abort", "after-abort") },
+      abort.signal,
+      onUpdate,
+    ),
+  ).rejects.toMatchObject({ name: "AbortError" });
+  expect(onUpdate).toHaveBeenCalledTimes(1);
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
   });
-
-  it("includes workdir flag when specified", () => {
-    const args = buildDockerExecArgs({
-      containerName: "test-container",
-      command: "pwd",
-      workdir: "/workspace",
-      env: { HOME: "/home/user" },
-      tty: false,
-    });
-
-    expect(args).toContain("-w");
-    expect(args).toContain("/workspace");
-  });
-
-  it("uses login shell for consistent environment", () => {
-    const args = buildDockerExecArgs({
-      containerName: "test-container",
-      command: "echo test",
-      env: { HOME: "/home/user" },
-      tty: false,
-    });
-
-    expect(args).toContain("sh");
-    expect(args).toContain("-lc");
-  });
-
-  it("includes tty flag when requested", () => {
-    const args = buildDockerExecArgs({
-      containerName: "test-container",
-      command: "bash",
-      env: { HOME: "/home/user" },
-      tty: true,
-    });
-
-    expect(args).toContain("-t");
-  });
+  expect(onUpdate).toHaveBeenCalledTimes(1);
 });

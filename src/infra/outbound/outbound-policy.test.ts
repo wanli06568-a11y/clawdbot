@@ -1,93 +1,163 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
+import type { OpenClawConfig } from "../../config/config.js";
 
-import type { ClawdbotConfig } from "../../config/config.js";
-import {
-  applyCrossContextDecoration,
-  buildCrossContextDecoration,
-  enforceCrossContextPolicy,
-} from "./outbound-policy.js";
+let applyCrossContextDecoration: typeof import("./outbound-policy.js").applyCrossContextDecoration;
+let buildCrossContextDecoration: typeof import("./outbound-policy.js").buildCrossContextDecoration;
+let enforceCrossContextPolicy: typeof import("./outbound-policy.js").enforceCrossContextPolicy;
 
-const slackConfig = {
-  channels: {
-    slack: {
-      botToken: "xoxb-test",
-      appToken: "xapp-test",
-    },
-  },
-} as ClawdbotConfig;
+const mocks = vi.hoisted(() => ({
+  getChannelPlugin: vi.fn<(channel: string) => Partial<ChannelPlugin> | undefined>((channel) => {
+    if (channel === "slack") {
+      return {
+        threading: {
+          matchesToolContextTarget: ({ target, toolContext }) =>
+            target === "U123" && toolContext.currentMessagingTarget === "user:U123",
+        },
+      };
+    }
+    if (channel === "richchat") {
+      return {
+        messaging: {
+          buildCrossContextPresentation: ({ originLabel, message }) => ({
+            blocks: [
+              ...(message.trim() ? [{ type: "text" as const, text: message }] : []),
+              { type: "context" as const, text: `From ${originLabel}` },
+            ],
+          }),
+        },
+      };
+    }
+    return undefined;
+  }),
+  normalizeTargetForProvider: vi.fn((channel: string, raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    return channel === "workspace" ? trimmed.replace(/^#/, "") : trimmed;
+  }),
+  lookupDirectoryDisplay: vi.fn(async ({ targetId }: { targetId: string }) =>
+    targetId.replace(/^#/, ""),
+  ),
+  formatTargetDisplay: vi.fn(
+    ({ target, display }: { target: string; display?: string }) => display ?? target,
+  ),
+}));
 
-const discordConfig = {
-  channels: {
-    discord: {},
-  },
-} as ClawdbotConfig;
+vi.mock("../../channels/plugins/index.js", () => ({
+  getChannelPlugin: mocks.getChannelPlugin,
+}));
 
-describe("outbound policy", () => {
-  it("blocks cross-provider sends by default", () => {
-    expect(() =>
-      enforceCrossContextPolicy({
-        cfg: slackConfig,
-        channel: "telegram",
-        action: "send",
-        args: { to: "telegram:@ops" },
-        toolContext: { currentChannelId: "C12345678", currentChannelProvider: "slack" },
-      }),
-    ).toThrow(/Cross-context messaging denied/);
+vi.mock("./target-normalization.js", () => ({
+  normalizeTargetForProvider: mocks.normalizeTargetForProvider,
+}));
+
+vi.mock("./target-resolver.js", () => ({
+  formatTargetDisplay: mocks.formatTargetDisplay,
+  lookupDirectoryDisplay: mocks.lookupDirectoryDisplay,
+}));
+
+function expectCrossContextPolicyResult(
+  expected: "allow" | RegExp,
+  params: Parameters<typeof enforceCrossContextPolicy>[0],
+) {
+  const run = () => enforceCrossContextPolicy(params);
+  if (expected === "allow") {
+    expect(run()).toBeUndefined();
+    return;
+  }
+  expect(run).toThrow(expected);
+}
+
+describe("outbound policy helpers", () => {
+  beforeAll(async () => {
+    ({ applyCrossContextDecoration, buildCrossContextDecoration, enforceCrossContextPolicy } =
+      await import("./outbound-policy.js"));
   });
 
-  it("allows cross-provider sends when enabled", () => {
-    const cfg = {
-      ...slackConfig,
-      tools: {
-        message: { crossContext: { allowAcrossProviders: true } },
-      },
-    } as ClawdbotConfig;
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
 
+  it.each([
+    { name: "default cross-provider access", provider: "webchat", expected: "allow" as const },
+    {
+      name: "explicit cross-provider denial",
+      provider: "webchat",
+      policy: { allowAcrossProviders: false },
+      expected: /target provider/,
+    },
+    {
+      name: "same-provider targetless context",
+      provider: "discord",
+      policy: { allowWithinProvider: false },
+      expected: "allow" as const,
+    },
+  ])("preserves $name without a current target", ({ provider, policy, expected }) => {
+    expectCrossContextPolicyResult(expected, {
+      cfg: { tools: { message: { crossContext: policy } } },
+      channel: "discord",
+      action: "send",
+      args: { to: "channel:123" },
+      toolContext: { currentChannelProvider: provider },
+    });
+  });
+
+  it("enforces the agent's cross-context policy", () => {
+    expectCrossContextPolicyResult(/target="C999" while bound to "C123"/, {
+      cfg: {
+        channels: { workspace: { botToken: "workspace-test", appToken: "workspace-app-test" } },
+        agents: {
+          entries: {
+            sandbox: {
+              tools: { message: { crossContext: { allowWithinProvider: false } } },
+            },
+          },
+        },
+      } as OpenClawConfig,
+      channel: "workspace",
+      action: "send",
+      args: { to: "C999" },
+      toolContext: { currentChannelId: "C123", currentChannelProvider: "workspace" },
+      agentId: "sandbox",
+    });
+  });
+
+  it("allows a routable alias of the native current channel", () => {
     expect(() =>
       enforceCrossContextPolicy({
-        cfg,
-        channel: "telegram",
+        channel: "slack",
         action: "send",
-        args: { to: "telegram:@ops" },
-        toolContext: { currentChannelId: "C12345678", currentChannelProvider: "slack" },
+        args: { to: "U123" },
+        toolContext: {
+          currentChannelId: "D123",
+          currentMessagingTarget: "user:U123",
+          currentChannelProvider: "slack",
+        },
+        cfg: { tools: { message: { crossContext: { allowWithinProvider: false } } } },
       }),
     ).not.toThrow();
   });
 
-  it("blocks same-provider cross-context when disabled", () => {
-    const cfg = {
-      ...slackConfig,
-      tools: { message: { crossContext: { allowWithinProvider: false } } },
-    } as ClawdbotConfig;
-
-    expect(() =>
-      enforceCrossContextPolicy({
-        cfg,
-        channel: "slack",
-        action: "send",
-        args: { to: "C99999999" },
-        toolContext: { currentChannelId: "C12345678", currentChannelProvider: "slack" },
-      }),
-    ).toThrow(/Cross-context messaging denied/);
-  });
-
-  it("uses embeds when available and preferred", async () => {
+  it("uses presentation when available and preferred", async () => {
     const decoration = await buildCrossContextDecoration({
-      cfg: discordConfig,
-      channel: "discord",
+      cfg: { channels: { richchat: {} } } as OpenClawConfig,
+      channel: "richchat",
       target: "123",
-      toolContext: { currentChannelId: "C12345678", currentChannelProvider: "discord" },
+      toolContext: { currentChannelId: "C12345678", currentChannelProvider: "richchat" },
     });
 
-    expect(decoration).not.toBeNull();
+    if (!decoration) {
+      throw new Error("Expected cross-context decoration");
+    }
     const applied = applyCrossContextDecoration({
       message: "hello",
-      decoration: decoration!,
-      preferEmbeds: true,
+      decoration,
+      preferPresentation: true,
     });
 
-    expect(applied.usedEmbeds).toBe(true);
-    expect(applied.embeds?.length).toBeGreaterThan(0);
+    expect(applied.presentation?.blocks.length).toBeGreaterThan(0);
     expect(applied.message).toBe("hello");
   });
 });

@@ -10,7 +10,7 @@ List tmux sessions on a socket (default tmux socket if none provided).
 Options:
   -L, --socket       tmux socket name (passed to tmux -L)
   -S, --socket-path  tmux socket path (passed to tmux -S)
-  -A, --all          scan all sockets under CLAWDBOT_TMUX_SOCKET_DIR
+  -A, --all          scan all sockets under OPENCLAW_TMUX_SOCKET_DIR
   -q, --query        case-insensitive substring to filter session names
   -h, --help         show this help
 USAGE
@@ -20,7 +20,7 @@ socket_name=""
 socket_path=""
 query=""
 scan_all=false
-socket_dir="${CLAWDBOT_TMUX_SOCKET_DIR:-${TMPDIR:-/tmp}/clawdbot-tmux-sockets}"
+socket_dir="${OPENCLAW_TMUX_SOCKET_DIR:-${TMPDIR:-/tmp}/openclaw-tmux-sockets}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,13 +52,20 @@ list_sessions() {
   local label="$1"; shift
   local tmux_cmd=(tmux "$@")
 
-  if ! sessions="$("${tmux_cmd[@]}" list-sessions -F '#{session_name}\t#{session_attached}\t#{session_created_string}' 2>/dev/null)"; then
+  local session_format=$'#{session_name}\t#{session_attached}\t#{t:session_created}'
+
+  if ! sessions="$("${tmux_cmd[@]}" list-sessions -F "$session_format" 2>/dev/null)"; then
     echo "No tmux server found on $label" >&2
     return 1
   fi
 
   if [[ -n "$query" ]]; then
-    sessions="$(printf '%s\n' "$sessions" | grep -i -- "$query" || true)"
+    sessions="$(printf '%s\n' "$sessions" |
+      while IFS= read -r session; do
+        if printf '%s\n' "${session%%$'\t'*}" | grep -Fqi -- "$query"; then
+          printf '%s\n' "$session"
+        fi
+      done)"
   fi
 
   if [[ -z "$sessions" ]]; then
@@ -68,7 +75,7 @@ list_sessions() {
 
   echo "Sessions on $label:"
   printf '%s\n' "$sessions" | while IFS=$'\t' read -r name attached created; do
-    attached_label=$([[ "$attached" == "1" ]] && echo "attached" || echo "detached")
+    attached_label=$([[ "$attached" -gt 0 ]] && echo "attached" || echo "detached")
     printf '  - %s (%s, started %s)\n' "$name" "$attached_label" "$created"
   done
 }
@@ -79,9 +86,14 @@ if [[ "$scan_all" == true ]]; then
     exit 1
   fi
 
-  shopt -s nullglob
-  sockets=("$socket_dir"/*)
-  shopt -u nullglob
+  shopt -s nullglob dotglob
+  sockets=()
+  for sock in "$socket_dir"/*; do
+    if [[ -S "$sock" ]]; then
+      sockets+=("$sock")
+    fi
+  done
+  shopt -u nullglob dotglob
 
   if [[ "${#sockets[@]}" -eq 0 ]]; then
     echo "No sockets found under $socket_dir" >&2
@@ -90,9 +102,6 @@ if [[ "$scan_all" == true ]]; then
 
   exit_code=0
   for sock in "${sockets[@]}"; do
-    if [[ ! -S "$sock" ]]; then
-      continue
-    fi
     list_sessions "socket path '$sock'" -S "$sock" || exit_code=$?
   done
   exit "$exit_code"

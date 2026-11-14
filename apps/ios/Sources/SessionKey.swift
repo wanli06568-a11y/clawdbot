@@ -6,10 +6,10 @@ enum SessionKey {
         return trimmed.isEmpty ? "main" : trimmed
     }
 
-    static func isCanonicalMainSessionKey(_ value: String?) -> Bool {
-        let trimmed = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return false }
-        if trimmed == "global" { return true }
-        return trimmed.hasPrefix("agent:")
+    static func makeAgentSessionKey(agentId: String, baseKey: String) -> String {
+        let trimmedAgent = agentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedBase = self.normalizeMainKey(baseKey)
+        if trimmedAgent.isEmpty { return normalizedBase }
+        return "agent:\(trimmedAgent):\(normalizedBase)"
     }
 }

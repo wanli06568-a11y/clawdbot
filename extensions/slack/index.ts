@@ -1,18 +1,24 @@
-import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
+import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 
-import { slackPlugin } from "./src/channel.js";
-import { setSlackRuntime } from "./src/runtime.js";
-
-const plugin = {
+export default defineBundledChannelEntry({
   id: "slack",
   name: "Slack",
   description: "Slack channel plugin",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: ClawdbotPluginApi) {
-    setSlackRuntime(api.runtime);
-    api.registerChannel({ plugin: slackPlugin });
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./channel-plugin-api.js",
+    exportName: "slackPlugin",
   },
-};
-
-export default plugin;
+  secrets: {
+    specifier: "./secret-contract-api.js",
+    exportName: "channelSecrets",
+  },
+  runtime: {
+    specifier: "./runtime-setter-api.js",
+    exportName: "setSlackRuntime",
+  },
+  accountInspect: {
+    specifier: "./account-inspect-api.js",
+    exportName: "inspectSlackReadOnlyAccount",
+  },
+});

@@ -1,32 +1,36 @@
-import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
+import {
+  type AnyAgentTool,
+  defineBundledChannelEntry,
+  loadBundledEntryExportSync,
+} from "openclaw/plugin-sdk/channel-entry-contract";
+import { registerZalouserRuntimeLifecycle } from "./src/session-runtime.js";
 
-import { zalouserDock, zalouserPlugin } from "./src/channel.js";
-import { ZalouserToolSchema, executeZalouserTool } from "./src/tool.js";
-import { setZalouserRuntime } from "./src/runtime.js";
+function createZalouserTool(context?: unknown): AnyAgentTool {
+  const createTool = loadBundledEntryExportSync<(context?: unknown) => AnyAgentTool>(
+    import.meta.url,
+    {
+      specifier: "./api.js",
+      exportName: "createZalouserTool",
+    },
+  );
+  return createTool(context);
+}
 
-const plugin = {
+export default defineBundledChannelEntry({
   id: "zalouser",
   name: "Zalo Personal",
-  description: "Zalo personal account messaging via zca-cli",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: ClawdbotPluginApi) {
-    setZalouserRuntime(api.runtime);
-    // Register channel plugin (for onboarding & gateway)
-    api.registerChannel({ plugin: zalouserPlugin, dock: zalouserDock });
-
-    // Register agent tool
-    api.registerTool({
-      name: "zalouser",
-      label: "Zalo Personal",
-      description:
-        "Send messages and access data via Zalo personal account. " +
-        "Actions: send (text message), image (send image URL), link (send link), " +
-        "friends (list/search friends), groups (list groups), me (profile info), status (auth check).",
-      parameters: ZalouserToolSchema,
-      execute: executeZalouserTool,
-    });
+  description: "Zalo personal account messaging via native zca-js integration",
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./channel-plugin-api.js",
+    exportName: "zalouserPlugin",
   },
-};
-
-export default plugin;
+  runtime: {
+    specifier: "./runtime-api.js",
+    exportName: "setZalouserRuntime",
+  },
+  registerFull(api) {
+    api.registerTool((ctx) => createZalouserTool(ctx), { name: "zalouser" });
+  },
+  registerCapabilities: registerZalouserRuntimeLifecycle,
+});

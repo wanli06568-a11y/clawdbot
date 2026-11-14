@@ -1,140 +1,341 @@
 ---
-summary: "Clawdbot CLI reference for `clawdbot` commands, subcommands, and options"
+summary: "OpenClaw CLI index: command list, global flags, and links to per-command pages"
 read_when:
-  - Adding or modifying CLI commands or options
-  - Documenting new command surfaces
+  - Finding the right `openclaw` subcommand
+  - Looking up global flags or output styling rules
+  - Preparing an exact PostgreSQL shared-state target while offline
+title: "CLI reference"
 ---
 
-# CLI reference
+`openclaw` is the main CLI entry point. Each core command has a dedicated
+reference page or is documented with the command it aliases. This index lists
+the commands, global flags, and output styling rules that apply across the CLI.
 
-This page describes the current CLI behavior. If commands change, update this doc.
+Setup commands by intent:
+
+- `openclaw setup` and `openclaw onboard` verify inference first, then start OpenClaw for Gateway, workspace, channels, skills, and health setup.
+- `openclaw setup --baseline` creates the baseline config and workspace without walking the guided onboarding flow.
+- `openclaw configure` changes targeted parts of an existing setup: model auth, gateway, channels, plugins, or skills.
+- `openclaw channels add` configures channel accounts after the baseline exists. A channel selection alone uses guided setup. Account, credential, or channel-config flags use the direct path for scripts.
+
+<a id="status" />
 
 ## Command pages
 
-- [`setup`](/cli/setup)
-- [`onboard`](/cli/onboard)
-- [`configure`](/cli/configure)
-- [`config`](/cli/config)
-- [`doctor`](/cli/doctor)
-- [`dashboard`](/cli/dashboard)
-- [`reset`](/cli/reset)
-- [`uninstall`](/cli/uninstall)
-- [`update`](/cli/update)
-- [`message`](/cli/message)
-- [`agent`](/cli/agent)
-- [`agents`](/cli/agents)
-- [`acp`](/cli/acp)
-- [`status`](/cli/status)
-- [`health`](/cli/health)
-- [`sessions`](/cli/sessions)
-- [`gateway`](/cli/gateway)
-- [`logs`](/cli/logs)
-- [`system`](/cli/system)
-- [`models`](/cli/models)
-- [`memory`](/cli/memory)
-- [`nodes`](/cli/nodes)
-- [`devices`](/cli/devices)
-- [`node`](/cli/node)
-- [`approvals`](/cli/approvals)
-- [`sandbox`](/cli/sandbox)
-- [`tui`](/cli/tui)
-- [`browser`](/cli/browser)
-- [`cron`](/cli/cron)
-- [`dns`](/cli/dns)
-- [`docs`](/cli/docs)
-- [`hooks`](/cli/hooks)
-- [`webhooks`](/cli/webhooks)
-- [`pairing`](/cli/pairing)
-- [`plugins`](/cli/plugins) (plugin commands)
-- [`channels`](/cli/channels)
-- [`security`](/cli/security)
-- [`skills`](/cli/skills)
-- [`voicecall`](/cli/voicecall) (plugin; if installed)
+| Area                         | Commands                                                                                                                                                                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Setup and onboarding         | [`openclaw`](/cli/openclaw) · [`setup`](/cli/setup) · [`onboard`](/cli/onboard) · [`configure`](/cli/configure) · [`config`](/cli/config) · [`completion`](/cli/completion) · [`doctor`](/cli/doctor) · [`dashboard`](/cli/dashboard) |
+| Reset, backup, and migration | [`backup`](/cli/backup) · [`database`](/cli#database) · [`migrate`](/cli/migrate) · [`reset`](/cli/reset) · [`uninstall`](/cli/uninstall) · [`update`](/cli/update)                                                                   |
+| Messaging and agents         | [`message`](/cli/message) · [`agent`](/cli/agent) · [`agents`](/cli/agents) · [`templates`](/cli/templates) · [`attach`](/cli/attach) · [`acp`](/cli/acp) · [`mcp`](/cli/mcp)                                                         |
+| Health and sessions          | [`status`](/cli/status) · [`health`](/cli/health) · [`triage`](/cli/triage) · [`sessions`](/cli/sessions) · [`resume`](/cli/resume) · [`audit`](/cli/audit)                                                                           |
+| Gateway and logs             | [`gateway`](/cli/gateway) · [`logs`](/cli/logs) · [`system`](/cli/system)                                                                                                                                                             |
+| Models and inference         | [`models`](/cli/models) · [`promos`](/cli/promos) · [`infer`](/cli/infer) · `capability` (alias for [`infer`](/cli/infer)) · [`memory`](/cli/memory) · [`wiki`](/cli/wiki)                                                            |
+| Network and nodes            | [`connect`](/cli/connect) · [`directory`](/cli/directory) · [`nodes`](/cli/nodes) · [`node`](/cli/node) · [`worker`](/cli/worker) · [`id`](/cli/id)                                                                                   |
+| Runtime and sandbox          | [`approvals`](/cli/approvals) · `exec-policy` (see [`approvals`](/cli/approvals)) · [`sandbox`](/cli/sandbox) · [`tui`](/cli/tui) · `chat`/`terminal` (aliases for [`tui --local`](/cli/tui)) · [`browser`](/cli/browser)             |
+| Worktrees                    | [`worktrees`](/concepts/managed-worktrees)                                                                                                                                                                                            |
+| Automation                   | [`cron`](/cli/cron) (alias `automations`) · [`hooks`](/cli/hooks) · [`webhooks`](/cli/webhooks) · [`transcripts`](/cli/transcripts)                                                                                                   |
+| Discovery and docs           | [`dns`](/cli/dns) · [`docs`](/cli/docs)                                                                                                                                                                                               |
+| Pairing and channels         | [`pair`](/cli/pair) · [`pairing`](/cli/pairing) · [`qr`](/cli/qr) · [`devices`](/cli/devices) · [`channels`](/cli/channels) · [`users`](/cli/users)                                                                                   |
+| Security and plugins         | [`security`](/cli/security) · [`secrets`](/cli/secrets) · [`skills`](/cli/skills) · [`plugins`](/cli/plugins) · [`proxy`](/cli/proxy)                                                                                                 |
+| Legacy aliases               | [`daemon`](/cli/daemon) (gateway service) · [`clawbot`](/cli/clawbot) (namespace)                                                                                                                                                     |
+| Plugins (optional)           | [`file-transfer`](/cli/file-transfer) · [`path`](/cli/path) · [`policy`](/cli/policy) · [`voicecall`](/cli/voicecall) · [`workboard`](/cli/workboard) (if installed)                                                                  |
 
 ## Global flags
 
-- `--dev`: isolate state under `~/.clawdbot-dev` and shift default ports.
-- `--profile <name>`: isolate state under `~/.clawdbot-<name>`.
-- `--no-color`: disable ANSI colors.
-- `--update`: shorthand for `clawdbot update` (source installs only).
-- `-V`, `--version`, `-v`: print version and exit.
+| Flag                    | Purpose                                                                                                 |
+| ----------------------- | ------------------------------------------------------------------------------------------------------- |
+| `--dev`                 | Isolate state under `~/.openclaw-dev`, default gateway port 19001, and shift derived ports              |
+| `--profile <name>`      | Isolate state under `~/.openclaw-<name>` (`OPENCLAW_STATE_DIR`/`OPENCLAW_CONFIG_PATH`)                  |
+| `--container <name>`    | Run the CLI inside a running Podman/Docker container named `<name>` (default: env `OPENCLAW_CONTAINER`) |
+| `--log-level <level>`   | Override the global log level for file + console output                                                 |
+| `--no-color`            | Disable ANSI colors (`NO_COLOR=1` is also respected)                                                    |
+| `--update`              | Shorthand for [`openclaw update`](/cli/update); works for both source checkouts and package installs    |
+| `-V`, `--version`, `-v` | Print version and exit                                                                                  |
 
-## Output styling
+Place command-specific options after their command name, for example `openclaw status --json`. Global options such as `--profile` can precede the command.
 
-- ANSI colors and progress indicators only render in TTY sessions.
-- OSC-8 hyperlinks render as clickable links in supported terminals; otherwise we fall back to plain URLs.
-- `--json` (and `--plain` where supported) disables styling for clean output.
-- `--no-color` disables ANSI styling; `NO_COLOR=1` is also respected.
-- Long-running commands show a progress indicator (OSC 9;4 when supported).
+Unknown root options fail with an option error and a help hint instead of starting onboarding or the TUI.
+
+A named `--profile` replaces standard state and config paths inherited from
+another profile, including a running Gateway service. Explicitly customized
+state directories and config paths remain unchanged.
+
+Use `--` to stop option parsing. Command words still dispatch after it: for example,
+`openclaw -- config get gateway.port` reads the configured port. A token such as
+`--help` after `--` is a positional argument.
+
+## Output modes
+
+- ANSI colors and progress indicators render only in TTY sessions.
+- OSC-8 hyperlinks render as clickable links where supported. Otherwise the
+  CLI prints plain URLs.
+- Human-readable report values neutralize terminal escape sequences before styling.
+  Embedded newlines, carriage returns, and tabs appear as `\n`, `\r`, and `\t`
+  instead of changing the report layout. This display formatting does not change
+  the underlying paths, configuration values, or JSON fields.
+  Bidirectional formatting controls are removed from displayed values; ordinary
+  right-to-left letters and emoji are preserved.
+- On bounded reporting commands, `--json` reserves stdout for one JSON document.
+  The CLI suppresses styling and progress output. Warnings and diagnostics stay on
+  stderr.
+- Interactive UIs and wizards, long-running servers and streams, shell integration,
+  and pure side-effect commands may omit `--json` when they have no meaningful
+  report to return.
+- Long-running commands show a progress indicator (`OSC 9;4` when supported).
+- Connection failures give a short explanation and a status-check command. If a request may have completed, check its result before retrying. Unexpected failures point to a recovery command; use `OPENCLAW_DEBUG=1` when rerunning to include diagnostics. JSON failures keep their diagnostic fields.
+- Update failures keep their reason on stderr, including in JSON mode.
+- When the config file cannot be read (for example, a missing `$include` file), commands print the read error instead of pointing to `openclaw doctor`.
+- Resource cleanup failures are reported on stderr without replacing the command's result. Cleanup that exceeds its reporting deadline remains tracked and reports any later failure.
+
+### JSON failures
+
+Successful JSON payloads remain command-specific. When a command in JSON output
+mode fails, it exits nonzero and writes one JSON document to stdout with this
+envelope:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "type": "cli_error",
+    "message": "Description of the failure"
+  }
+}
+```
+
+A command may add domain-specific fields, such as per-item results, beside this
+envelope. Gateway-backed agent turns that fail after the Gateway accepted the run
+also record the accepted `runId` and `origin: "gateway"` beside the envelope, so
+scripts can report the in-flight run. Failure messages are sanitized. Human-readable
+diagnostics may also be written to stderr, so scripts should parse stdout and still
+check the exit status.
+
+Onboarding and setup failures retain `phase` and the top-level `message` beside
+the envelope. Use `error.message` for the shared failure description and `phase`
+for onboarding-specific recovery.
 
 ## Color palette
 
-Clawdbot uses a lobster palette for CLI output.
+OpenClaw uses a lobster palette for CLI output:
 
-- `accent` (#FF5A2D): headings, labels, primary highlights.
-- `accentBright` (#FF7A3D): command names, emphasis.
-- `accentDim` (#D14A22): secondary highlight text.
-- `info` (#FF8A5B): informational values.
-- `success` (#2FBF71): success states.
-- `warn` (#FFB020): warnings, fallbacks, attention.
-- `error` (#E23D2D): errors, failures.
-- `muted` (#8B7F77): de-emphasis, metadata.
+| Token          | Hex       | Used for                             |
+| -------------- | --------- | ------------------------------------ |
+| `accent`       | `#FF5A2D` | Headings, labels, primary highlights |
+| `accentBright` | `#FF7A3D` | Command names, emphasis              |
+| `accentDim`    | `#D14A22` | Secondary highlight text             |
+| `info`         | `#FF8A5B` | Informational values                 |
+| `success`      | `#2FBF71` | Success states                       |
+| `warn`         | `#FFB020` | Warnings, option flags, fallbacks    |
+| `error`        | `#E23D2D` | Errors, failures                     |
+| `muted`        | `#8B7F77` | De-emphasis, metadata                |
 
-Palette source of truth: `src/terminal/palette.ts` (aka “lobster seam”).
+Palette source of truth: `packages/terminal-core/src/palette.ts`.
 
 ## Command tree
 
+<Accordion title="Full command tree">
+
+This map covers core commands and their primary subcommands. Plugin-added
+subcommands (for example under `skills`, `plugins`, and `wiki`) evolve
+independently. Run `<command> --help` for the authoritative, current list.
+
 ```
-clawdbot [--dev] [--profile <name>] <command>
+openclaw [--dev] [--profile <name>] <command>
+  openclaw
   setup
   onboard
   configure
   config
     get
     set
+    patch
     unset
+    file
+    schema
+    validate
+  database
+    prepare-state
+    port
+    preflight
+    preflight-agent
+    verify-preservation
+    ownership
+      status
+      claim
+  completion
   doctor
+  triage
+  dashboard
+  backup
+    create
+    verify
+    restore
+    sqlite
+      create
+      list
+      verify
+      restore
+    git
+      init
+      create
+      log
+      verify
+      restore
+    enable
+    disable
+  migrate
+    list
+    plan <provider>
+    apply <provider>
   security
     audit
+  secrets
+    reload
+    store
+    audit
+    configure
+    apply
   reset
   uninstall
   update
+    wizard
+    status
+    repair
   channels
     list
     status
+    capabilities
+    resolve
     logs
+    dead-letters list|resubmit
     add
     remove
     login
     logout
+  directory
+    self
+    peers list
+    groups list|members
   skills
+    search
+    install
+    update
+    verify
+    workshop list|changes|show|archive|restore
     list
     info
     check
   plugins
     list
-    info
+    search
+    inspect
     install
+    uninstall
+    update
     enable
     disable
     doctor
+    build
+    validate
+    pack
+    init
+    registry
+    marketplace list|entries|refresh
+  workboard
+    list
+    create
+    show
+    dispatch
   memory
     status
     index
     search
+  transcripts
+    list
+    show
+    path
+  path
+    resolve
+    find
+    set
+    validate
+    emit
+  wiki
+    status
+    doctor
+    init
+    compile
+    lint
+    ingest
+    okf import
+    search
+    get
+    apply synthesis|metadata
+    bridge import
+    unsafe-local import
+    chatgpt import|rollback
+    obsidian status|search|open|command|daily
   message
+    send
+    broadcast
+    poll
+    react
+    reactions
+    read
+    edit
+    delete
+    pin
+    unpin
+    pins
+    permissions
+    search
+    thread create|list|reply
+    emoji list|upload
+    sticker send|upload
+    role info|add|remove
+    channel info|list
+    member info
+    voice status
+    event list|create
+    timeout
+    kick
+    ban
   agent
   agents
     list
     add
     delete
+    bindings
+    bind
+    unbind
+    set-identity
+  attach
   acp
+  mcp
+    serve
+    list
+    show
+    set
+    unset
   status
   health
   sessions
+    cleanup
+  audit
+  tasks
+    list
+    audit
+    maintenance
+    show
+    notify
+    cancel
+    flow list|show|cancel
   gateway
     call
+    usage-cost
     health
+    stability
+    diagnostics export
     status
     probe
     discover
@@ -144,6 +345,19 @@ clawdbot [--dev] [--profile <name>] <command>
     stop
     restart
     run
+  worktrees
+    list
+    create
+    remove
+    restore
+    gc
+  daemon
+    status
+    install
+    uninstall
+    start
+    stop
+    restart
   logs
   system
     event
@@ -158,8 +372,21 @@ clawdbot [--dev] [--profile <name>] <command>
     fallbacks list|add|remove|clear
     image-fallbacks list|add|remove|clear
     scan
-    auth add|setup-token|paste-token
+    auth list|add|login|setup-token|paste-token|paste-api-key|login-github-copilot
     auth order get|set|clear
+  promos
+    list
+    claim <slug>
+  infer (alias: capability)
+    list
+    inspect
+    model run|list|inspect|providers|auth login|logout|status
+    image generate|edit|describe|describe-many|providers
+    audio transcribe|providers
+    tts convert|voices|personas|providers|status|enable|disable|set-provider|set-persona
+    video generate|describe|providers
+    web search|fetch|providers
+    embedding create|providers
   sandbox
     list
     recreate
@@ -167,6 +394,8 @@ clawdbot [--dev] [--profile <name>] <command>
   cron
     status
     list
+    get
+    show
     add
     edit
     rm
@@ -174,20 +403,55 @@ clawdbot [--dev] [--profile <name>] <command>
     disable
     runs
     run
+    scratch
   nodes
+    status
+    describe
+    list
+    pending
+    approve
+    reject
+    rename
+    invoke
+    notify
+    push
+    canvas present|hide|navigate
+    camera list|snap|clip
+    screen record
+    location get
   devices
+    list
+    remove
+    clear
+    approve
+    reject
+    rotate
+    revoke
+  users
+    list
+    link-email <email> --to <profileId>
+    merge <sourceProfileId> --into <targetProfileId>
+  id
+    status
+    rebind [--code <code>] [--kit-stdin] [--binding-seq <n>] [--yes] [--cancel]
+    publish [--code <code>]
   node
     run
     status
     install
     uninstall
-    start
     stop
     restart
+  connect
+  worker
   approvals
     get
     set
     allowlist add|remove
+  exec-policy
+    show
+    preset
+    set
   browser
     status
     start
@@ -227,692 +491,164 @@ clawdbot [--dev] [--profile <name>] <command>
     update
   webhooks
     gmail setup|run
+  proxy
+    start
+    run
+    coverage
+    sessions
+    query
+    blob
+    purge
   pairing
     list
     approve
+  pair
+  qr
+  clawbot
+    qr
   docs
   dns
     setup
+  resume
   tui
+  chat (alias: tui --local)
+  terminal (alias: tui --local)
 ```
 
-Note: plugins can add additional top-level commands (for example `clawdbot voicecall`).
+Plugins can add additional top-level commands, such as
+[`openclaw workboard`](/cli/workboard) or `openclaw voicecall`.
 
-## Security
+</Accordion>
 
-- `clawdbot security audit` — audit config + local state for common security foot-guns.
-- `clawdbot security audit --deep` — best-effort live Gateway probe.
-- `clawdbot security audit --fix` — tighten safe defaults and chmod state/config.
+## Database
 
-## Plugins
+`openclaw database` provides shared-state preparation, schema preflight,
+preservation verification, shared-state ownership, and offline database-family engine porting. See
+[database schemas](/reference/database-schemas) for compatibility contracts.
 
-Manage extensions and their config:
+```bash
+openclaw database port --to <postgres|sqlite> [--dry-run] [--json]
+openclaw database port --family <state|agent|workboard|logbook|team-reports> --to <postgres|sqlite> [--dry-run] [--json]
+openclaw database port --resume <manifest> [--json]
+openclaw database port --rollback <manifest> [--json]
+```
 
-- `clawdbot plugins list` — discover plugins (use `--json` for machine output).
-- `clawdbot plugins info <id>` — show details for a plugin.
-- `clawdbot plugins install <path|.tgz|npm-spec>` — install a plugin (or add a plugin path to `plugins.load.paths`).
-- `clawdbot plugins enable <id>` / `disable <id>` — toggle `plugins.entries.<id>.enabled`.
-- `clawdbot plugins doctor` — report plugin load errors.
+Stop the Gateway and embedded agents first. `--family` selects all existing
+physical stores of one family and changes only that family's override. Omit it
+to port all eligible families when their engines are homogeneous; mixed
+selections require a family. Agent and shared-state families can use different
+engines. `--dry-run` checks
+read-only prerequisites without creating migration
+artifacts. Recovery requires the active manifest at
+`<stateDir>/recovery/database-port/manifest.json`; `--resume` and `--rollback` are
+mutually exclusive and cannot be combined with `--family`, `--to`, or `--dry-run`.
 
-Most plugin changes require a gateway restart. See [/plugin](/plugin).
+Completed ports retain exact original captures and an archived manifest under
+`<stateDir>/recovery/database-port/<operation-id>/`. To keep later writes when
+returning to SQLite, run a new `--to sqlite` port; completed manifests are not an
+undo mechanism. Reverse-port before a raw package-manager downgrade. See the
+[port runbook](/reference/database-engines#port-existing-stores) for
+backup contents, interruption recovery, and restart guidance.
 
-## Memory
+### Prepare exact PostgreSQL shared state
 
-Vector search over `MEMORY.md` + `memory/*.md`:
+Use `prepare-state` to initialize an absent PostgreSQL shared-state namespace or
+validate an existing one for the installed OpenClaw version. It requires valid
+PostgreSQL configuration for the `state` family and an **existing matching local
+anchor** in the selected profile/state directory; it does not create or replace
+an anchor, port SQLite data, or select a new store identity.
 
-- `clawdbot memory status` — show index stats.
-- `clawdbot memory index` — reindex memory files.
-- `clawdbot memory search "<query>"` — semantic search over memory.
+Stop the Gateway and embedded agents first. The command acquires exclusive
+shared-state schema custody without waiting for another owner and closes its
+native resources before releasing custody. It does not stop a running owner or
+bypass an unfinished database port.
+
+```bash
+openclaw database prepare-state --expected-store-id <uuid> --expected-namespace <namespace> --json
+```
+
+Both identity options are required:
+
+- `--expected-store-id <uuid>` must exactly match the store UUID in the existing
+  PostgreSQL anchor. Do not generate a replacement UUID.
+- `--expected-namespace <namespace>` must exactly match both the anchor's namespace
+  and `<schemaPrefix>_state_<uuid-prefix>` for the configured
+  `database.postgres.schemaPrefix`. Here, `uuid-prefix` is the first 16 characters
+  of the store UUID with hyphens removed. The namespace accepts lowercase letters,
+  digits, and underscores, starting with a letter or underscore.
+
+Only a namespace that is entirely absent is bootstrapped with the installed
+schema. An existing namespace, even an empty or incomplete one, is never treated
+as new: it must pass existing-only identity, metadata, catalog, and current
+schema-version validation. This command does not migrate or repair existing state.
+See [anchors and catalog admission](/reference/database-engines#anchors-and-backups).
+
+Success reports `prepared` after bootstrap or `ready` for an already valid store.
+With `--json`, the result includes `ok`, `status`, `path` (the local anchor),
+`storeId`, `namespace`, and `schemaVersion`. Without it, the command prints
+`Shared state: <status> (<namespace>).` Failures exit nonzero; `--json` uses the
+[JSON failure envelope](/cli#json-failures).
+
+If identity validation fails, check the selected profile, configuration, and
+matched anchor before retrying. For incompatible or incomplete existing storage,
+use a compatible OpenClaw version or restore a matched backup; do not delete the
+namespace or edit its metadata to force preparation.
+
+### Exact SQLite migration capture
+
+An external controller can capture a running local Gateway only while it holds a
+ready, non-drain suspension with terminal sessions preserved and zero write custody.
+Use the controller's existing request and suspension IDs; this command neither
+creates the initial suspension nor resumes or stops the Gateway.
+
+```bash
+openclaw database migration-capture create --externally-quiesced --request-id <request> --suspension-id <suspension> --output <private-directory> --json
+openclaw database migration-capture restore <capture> --target <empty-staging-directory> --manifest-sha256 <producer-digest> --json
+```
+
+Quiesced capture authenticates to the selected local backend with its shared token
+or password. It creates its own verified filesystem archive and exact SQLite images
+under the same bounded suspension without writing to the source database or journal
+files. The Gateway keeps its live ownership heartbeat: its own lease timestamps can
+advance during suspension. Capture does not stop those renewals or treat a captured
+lease as authority to activate restored state.
+Filesystem archive creation and verification run in a joined subprocess so blocking
+SQLite or filesystem work does not prevent suspension renewal. The archive step has
+a 30-minute deadline; cancellation waits for the child to stop before capture returns.
+It renews only the supplied controller request and refuses changed owners, expired
+suspensions, pending writes, and PostgreSQL sources. The controller must retain the
+suspension until capture finishes, then decide whether to resume or stop its Gateway.
+
+The output must be outside the source state and configuration roots. Restore only
+extracts into new private staging; it never activates that state. Preserve the
+producer's manifest digest and the same logical source paths. Exact captures contain
+private credentials and retained operational state, unlike sanitized ordinary backups.
+For a stopped source, the existing offline mode instead requires `--base-archive`
+from that same stopped state and does not accept suspension IDs.
 
 ## Chat slash commands
 
-Chat messages support `/...` commands (text and native). See [/tools/slash-commands](/tools/slash-commands).
+Chat messages support `/...` commands. See [slash commands](/tools/slash-commands).
 
 Highlights:
-- `/status` for quick diagnostics.
-- `/config` for persisted config changes.
-- `/debug` for runtime-only config overrides (memory, not disk; requires `commands.debug: true`).
 
-## Setup + onboarding
+- `/status` - quick diagnostics.
+- `/trace` - session-scoped plugin trace/debug lines.
+- `/config` - persisted config changes.
+- `/debug` - runtime-only config overrides in memory, not on disk. Requires `commands.debug: true`.
 
-### `setup`
-Initialize config + workspace.
+## Usage tracking
 
-Options:
-- `--workspace <dir>`: agent workspace path (default `~/clawd`).
-- `--wizard`: run the onboarding wizard.
-- `--non-interactive`: run wizard without prompts.
-- `--mode <local|remote>`: wizard mode.
-- `--remote-url <url>`: remote Gateway URL.
-- `--remote-token <token>`: remote Gateway token.
+`openclaw status --usage` and the Control UI surface provider usage/quota when
+OAuth/API credentials are available. Data comes directly from provider usage
+endpoints and is normalized to `X% left`. Providers with current usage
+windows: Anthropic, Gemini CLI, GitHub Copilot, MiniMax, OpenAI Codex,
+Xiaomi, and z.ai.
 
-Wizard auto-runs when any wizard flags are present (`--non-interactive`, `--mode`, `--remote-url`, `--remote-token`).
+See [Usage tracking](/concepts/usage-tracking) for details.
 
-### `onboard`
-Interactive wizard to set up gateway, workspace, and skills.
+## Related
 
-Options:
-- `--workspace <dir>`
-- `--reset` (reset config + credentials + sessions + workspace before wizard)
-- `--non-interactive`
-- `--mode <local|remote>`
-- `--flow <quickstart|advanced|manual>` (manual is an alias for advanced)
-- `--auth-choice <setup-token|token|chutes|openai-codex|openai-api-key|openrouter-api-key|ai-gateway-api-key|moonshot-api-key|kimi-code-api-key|synthetic-api-key|venice-api-key|gemini-api-key|zai-api-key|apiKey|minimax-api|minimax-api-lightning|opencode-zen|skip>`
-- `--token-provider <id>` (non-interactive; used with `--auth-choice token`)
-- `--token <token>` (non-interactive; used with `--auth-choice token`)
-- `--token-profile-id <id>` (non-interactive; default: `<provider>:manual`)
-- `--token-expires-in <duration>` (non-interactive; e.g. `365d`, `12h`)
-- `--anthropic-api-key <key>`
-- `--openai-api-key <key>`
-- `--openrouter-api-key <key>`
-- `--ai-gateway-api-key <key>`
-- `--moonshot-api-key <key>`
-- `--kimi-code-api-key <key>`
-- `--gemini-api-key <key>`
-- `--zai-api-key <key>`
-- `--minimax-api-key <key>`
-- `--opencode-zen-api-key <key>`
-- `--gateway-port <port>`
-- `--gateway-bind <loopback|lan|tailnet|auto|custom>`
-- `--gateway-auth <token|password>`
-- `--gateway-token <token>`
-- `--gateway-password <password>`
-- `--remote-url <url>`
-- `--remote-token <token>`
-- `--tailscale <off|serve|funnel>`
-- `--tailscale-reset-on-exit`
-- `--install-daemon`
-- `--no-install-daemon` (alias: `--skip-daemon`)
-- `--daemon-runtime <node|bun>`
-- `--skip-channels`
-- `--skip-skills`
-- `--skip-health`
-- `--skip-ui`
-- `--node-manager <npm|pnpm|bun>` (pnpm recommended; bun not recommended for Gateway runtime)
-- `--json`
-
-### `configure`
-Interactive configuration wizard (models, channels, skills, gateway).
-
-### `config`
-Non-interactive config helpers (get/set/unset). Running `clawdbot config` with no
-subcommand launches the wizard.
-
-Subcommands:
-- `config get <path>`: print a config value (dot/bracket path).
-- `config set <path> <value>`: set a value (JSON5 or raw string).
-- `config unset <path>`: remove a value.
-
-### `doctor`
-Health checks + quick fixes (config + gateway + legacy services).
-
-Options:
-- `--no-workspace-suggestions`: disable workspace memory hints.
-- `--yes`: accept defaults without prompting (headless).
-- `--non-interactive`: skip prompts; apply safe migrations only.
-- `--deep`: scan system services for extra gateway installs.
-
-## Channel helpers
-
-### `channels`
-Manage chat channel accounts (WhatsApp/Telegram/Discord/Google Chat/Slack/Mattermost (plugin)/Signal/iMessage/MS Teams).
-
-Subcommands:
-- `channels list`: show configured channels and auth profiles.
-- `channels status`: check gateway reachability and channel health (`--probe` runs extra checks; use `clawdbot health` or `clawdbot status --deep` for gateway health probes).
-- Tip: `channels status` prints warnings with suggested fixes when it can detect common misconfigurations (then points you to `clawdbot doctor`).
-- `channels logs`: show recent channel logs from the gateway log file.
-- `channels add`: wizard-style setup when no flags are passed; flags switch to non-interactive mode.
-- `channels remove`: disable by default; pass `--delete` to remove config entries without prompts.
-- `channels login`: interactive channel login (WhatsApp Web only).
-- `channels logout`: log out of a channel session (if supported).
-
-Common options:
-- `--channel <name>`: `whatsapp|telegram|discord|googlechat|slack|mattermost|signal|imessage|msteams`
-- `--account <id>`: channel account id (default `default`)
-- `--name <label>`: display name for the account
-
-`channels login` options:
-- `--channel <channel>` (default `whatsapp`; supports `whatsapp`/`web`)
-- `--account <id>`
-- `--verbose`
-
-`channels logout` options:
-- `--channel <channel>` (default `whatsapp`)
-- `--account <id>`
-
-`channels list` options:
-- `--no-usage`: skip model provider usage/quota snapshots (OAuth/API-backed only).
-- `--json`: output JSON (includes usage unless `--no-usage` is set).
-
-`channels logs` options:
-- `--channel <name|all>` (default `all`)
-- `--lines <n>` (default `200`)
-- `--json`
-
-More detail: [/concepts/oauth](/concepts/oauth)
-
-Examples:
-```bash
-clawdbot channels add --channel telegram --account alerts --name "Alerts Bot" --token $TELEGRAM_BOT_TOKEN
-clawdbot channels add --channel discord --account work --name "Work Bot" --token $DISCORD_BOT_TOKEN
-clawdbot channels remove --channel discord --account work --delete
-clawdbot channels status --probe
-clawdbot status --deep
-```
-
-### `skills`
-List and inspect available skills plus readiness info.
-
-Subcommands:
-- `skills list`: list skills (default when no subcommand).
-- `skills info <name>`: show details for one skill.
-- `skills check`: summary of ready vs missing requirements.
-
-Options:
-- `--eligible`: show only ready skills.
-- `--json`: output JSON (no styling).
-- `-v`, `--verbose`: include missing requirements detail.
-
-Tip: use `npx clawdhub` to search, install, and sync skills.
-
-### `pairing`
-Approve DM pairing requests across channels.
-
-Subcommands:
-- `pairing list <channel> [--json]`
-- `pairing approve <channel> <code> [--notify]`
-
-### `webhooks gmail`
-Gmail Pub/Sub hook setup + runner. See [/automation/gmail-pubsub](/automation/gmail-pubsub).
-
-Subcommands:
-- `webhooks gmail setup` (requires `--account <email>`; supports `--project`, `--topic`, `--subscription`, `--label`, `--hook-url`, `--hook-token`, `--push-token`, `--bind`, `--port`, `--path`, `--include-body`, `--max-bytes`, `--renew-minutes`, `--tailscale`, `--tailscale-path`, `--tailscale-target`, `--push-endpoint`, `--json`)
-- `webhooks gmail run` (runtime overrides for the same flags)
-
-### `dns setup`
-Wide-area discovery DNS helper (CoreDNS + Tailscale). See [/gateway/discovery](/gateway/discovery).
-
-Options:
-- `--apply`: install/update CoreDNS config (requires sudo; macOS only).
-
-## Messaging + agent
-
-### `message`
-Unified outbound messaging + channel actions.
-
-See: [/cli/message](/cli/message)
-
-Subcommands:
-- `message send|poll|react|reactions|read|edit|delete|pin|unpin|pins|permissions|search|timeout|kick|ban`
-- `message thread <create|list|reply>`
-- `message emoji <list|upload>`
-- `message sticker <send|upload>`
-- `message role <info|add|remove>`
-- `message channel <info|list>`
-- `message member info`
-- `message voice status`
-- `message event <list|create>`
-
-Examples:
-- `clawdbot message send --target +15555550123 --message "Hi"`
-- `clawdbot message poll --channel discord --target channel:123 --poll-question "Snack?" --poll-option Pizza --poll-option Sushi`
-
-### `agent`
-Run one agent turn via the Gateway (or `--local` embedded).
-
-Required:
-- `--message <text>`
-
-Options:
-- `--to <dest>` (for session key and optional delivery)
-- `--session-id <id>`
-- `--thinking <off|minimal|low|medium|high|xhigh>` (GPT-5.2 + Codex models only)
-- `--verbose <on|full|off>`
-- `--channel <whatsapp|telegram|discord|slack|mattermost|signal|imessage|msteams>`
-- `--local`
-- `--deliver`
-- `--json`
-- `--timeout <seconds>`
-
-### `agents`
-Manage isolated agents (workspaces + auth + routing).
-
-#### `agents list`
-List configured agents.
-
-Options:
-- `--json`
-- `--bindings`
-
-#### `agents add [name]`
-Add a new isolated agent. Runs the guided wizard unless flags (or `--non-interactive`) are passed; `--workspace` is required in non-interactive mode.
-
-Options:
-- `--workspace <dir>`
-- `--model <id>`
-- `--agent-dir <dir>`
-- `--bind <channel[:accountId]>` (repeatable)
-- `--non-interactive`
-- `--json`
-
-Binding specs use `channel[:accountId]`. When `accountId` is omitted for WhatsApp, the default account id is used.
-
-#### `agents delete <id>`
-Delete an agent and prune its workspace + state.
-
-Options:
-- `--force`
-- `--json`
-
-### `acp`
-Run the ACP bridge that connects IDEs to the Gateway.
-
-See [`acp`](/cli/acp) for full options and examples.
-
-### `status`
-Show linked session health and recent recipients.
-
-Options:
-- `--json`
-- `--all` (full diagnosis; read-only, pasteable)
-- `--deep` (probe channels)
-- `--usage` (show model provider usage/quota)
-- `--timeout <ms>`
-- `--verbose`
-- `--debug` (alias for `--verbose`)
-
-Notes:
-- Overview includes Gateway + node host service status when available.
-
-### Usage tracking
-Clawdbot can surface provider usage/quota when OAuth/API creds are available.
-
-Surfaces:
-- `/status` (adds a short provider usage line when available)
-- `clawdbot status --usage` (prints full provider breakdown)
-- macOS menu bar (Usage section under Context)
-
-Notes:
-- Data comes directly from provider usage endpoints (no estimates).
-- Providers: Anthropic, GitHub Copilot, OpenAI Codex OAuth, plus Gemini CLI/Antigravity when those provider plugins are enabled.
-- If no matching credentials exist, usage is hidden.
-- Details: see [Usage tracking](/concepts/usage-tracking).
-
-### `health`
-Fetch health from the running Gateway.
-
-Options:
-- `--json`
-- `--timeout <ms>`
-- `--verbose`
-
-### `sessions`
-List stored conversation sessions.
-
-Options:
-- `--json`
-- `--verbose`
-- `--store <path>`
-- `--active <minutes>`
-
-## Reset / Uninstall
-
-### `reset`
-Reset local config/state (keeps the CLI installed).
-
-Options:
-- `--scope <config|config+creds+sessions|full>`
-- `--yes`
-- `--non-interactive`
-- `--dry-run`
-
-Notes:
-- `--non-interactive` requires `--scope` and `--yes`.
-
-### `uninstall`
-Uninstall the gateway service + local data (CLI remains).
-
-Options:
-- `--service`
-- `--state`
-- `--workspace`
-- `--app`
-- `--all`
-- `--yes`
-- `--non-interactive`
-- `--dry-run`
-
-Notes:
-- `--non-interactive` requires `--yes` and explicit scopes (or `--all`).
-
-## Gateway
-
-### `gateway`
-Run the WebSocket Gateway.
-
-Options:
-- `--port <port>`
-- `--bind <loopback|tailnet|lan|auto|custom>`
-- `--token <token>`
-- `--auth <token|password>`
-- `--password <password>`
-- `--tailscale <off|serve|funnel>`
-- `--tailscale-reset-on-exit`
-- `--allow-unconfigured`
-- `--dev`
-- `--reset` (reset dev config + credentials + sessions + workspace)
-- `--force` (kill existing listener on port)
-- `--verbose`
-- `--claude-cli-logs`
-- `--ws-log <auto|full|compact>`
-- `--compact` (alias for `--ws-log compact`)
-- `--raw-stream`
-- `--raw-stream-path <path>`
-
-### `gateway service`
-Manage the Gateway service (launchd/systemd/schtasks).
-
-Subcommands:
-- `gateway status` (probes the Gateway RPC by default)
-- `gateway install` (service install)
-- `gateway uninstall`
-- `gateway start`
-- `gateway stop`
-- `gateway restart`
-
-Notes:
-- `gateway status` probes the Gateway RPC by default using the service’s resolved port/config (override with `--url/--token/--password`).
-- `gateway status` supports `--no-probe`, `--deep`, and `--json` for scripting.
-- `gateway status` also surfaces legacy or extra gateway services when it can detect them (`--deep` adds system-level scans). Profile-named Clawdbot services are treated as first-class and aren't flagged as "extra".
-- `gateway status` prints which config path the CLI uses vs which config the service likely uses (service env), plus the resolved probe target URL.
-- `gateway install|uninstall|start|stop|restart` support `--json` for scripting (default output stays human-friendly).
-- `gateway install` defaults to Node runtime; bun is **not recommended** (WhatsApp/Telegram bugs).
-- `gateway install` options: `--port`, `--runtime`, `--token`, `--force`, `--json`.
-
-### `logs`
-Tail Gateway file logs via RPC.
-
-Notes:
-- TTY sessions render a colorized, structured view; non-TTY falls back to plain text.
-- `--json` emits line-delimited JSON (one log event per line).
-
-Examples:
-```bash
-clawdbot logs --follow
-clawdbot logs --limit 200
-clawdbot logs --plain
-clawdbot logs --json
-clawdbot logs --no-color
-```
-
-### `gateway <subcommand>`
-Gateway CLI helpers (use `--url`, `--token`, `--password`, `--timeout`, `--expect-final` for RPC subcommands).
-
-Subcommands:
-- `gateway call <method> [--params <json>]`
-- `gateway health`
-- `gateway status`
-- `gateway probe`
-- `gateway discover`
-- `gateway install|uninstall|start|stop|restart`
-- `gateway run`
-
-Common RPCs:
-- `config.apply` (validate + write config + restart + wake)
-- `config.patch` (merge a partial update + restart + wake)
-- `update.run` (run update + restart + wake)
-
-Tip: when calling `config.set`/`config.apply`/`config.patch` directly, pass `baseHash` from
-`config.get` if a config already exists.
-
-## Models
-
-See [/concepts/models](/concepts/models) for fallback behavior and scanning strategy.
-
-Preferred Anthropic auth (setup-token):
-
-```bash
-claude setup-token
-clawdbot models auth setup-token --provider anthropic
-clawdbot models status
-```
-
-### `models` (root)
-`clawdbot models` is an alias for `models status`.
-
-Root options:
-- `--status-json` (alias for `models status --json`)
-- `--status-plain` (alias for `models status --plain`)
-
-### `models list`
-Options:
-- `--all`
-- `--local`
-- `--provider <name>`
-- `--json`
-- `--plain`
-
-### `models status`
-Options:
-- `--json`
-- `--plain`
-- `--check` (exit 1=expired/missing, 2=expiring)
-- `--probe` (live probe of configured auth profiles)
-- `--probe-provider <name>`
-- `--probe-profile <id>` (repeat or comma-separated)
-- `--probe-timeout <ms>`
-- `--probe-concurrency <n>`
-- `--probe-max-tokens <n>`
-
-Always includes the auth overview and OAuth expiry status for profiles in the auth store.
-`--probe` runs live requests (may consume tokens and trigger rate limits).
-
-### `models set <model>`
-Set `agents.defaults.model.primary`.
-
-### `models set-image <model>`
-Set `agents.defaults.imageModel.primary`.
-
-### `models aliases list|add|remove`
-Options:
-- `list`: `--json`, `--plain`
-- `add <alias> <model>`
-- `remove <alias>`
-
-### `models fallbacks list|add|remove|clear`
-Options:
-- `list`: `--json`, `--plain`
-- `add <model>`
-- `remove <model>`
-- `clear`
-
-### `models image-fallbacks list|add|remove|clear`
-Options:
-- `list`: `--json`, `--plain`
-- `add <model>`
-- `remove <model>`
-- `clear`
-
-### `models scan`
-Options:
-- `--min-params <b>`
-- `--max-age-days <days>`
-- `--provider <name>`
-- `--max-candidates <n>`
-- `--timeout <ms>`
-- `--concurrency <n>`
-- `--no-probe`
-- `--yes`
-- `--no-input`
-- `--set-default`
-- `--set-image`
-- `--json`
-
-### `models auth add|setup-token|paste-token`
-Options:
-- `add`: interactive auth helper
-- `setup-token`: `--provider <name>` (default `anthropic`), `--yes`
-- `paste-token`: `--provider <name>`, `--profile-id <id>`, `--expires-in <duration>`
-
-### `models auth order get|set|clear`
-Options:
-- `get`: `--provider <name>`, `--agent <id>`, `--json`
-- `set`: `--provider <name>`, `--agent <id>`, `<profileIds...>`
-- `clear`: `--provider <name>`, `--agent <id>`
-
-## System
-
-### `system event`
-Enqueue a system event and optionally trigger a heartbeat (Gateway RPC).
-
-Required:
-- `--text <text>`
-
-Options:
-- `--mode <now|next-heartbeat>`
-- `--json`
-- `--url`, `--token`, `--timeout`, `--expect-final`
-
-### `system heartbeat last|enable|disable`
-Heartbeat controls (Gateway RPC).
-
-Options:
-- `--json`
-- `--url`, `--token`, `--timeout`, `--expect-final`
-
-### `system presence`
-List system presence entries (Gateway RPC).
-
-Options:
-- `--json`
-- `--url`, `--token`, `--timeout`, `--expect-final`
-
-## Cron
-Manage scheduled jobs (Gateway RPC). See [/automation/cron-jobs](/automation/cron-jobs).
-
-Subcommands:
-- `cron status [--json]`
-- `cron list [--all] [--json]` (table output by default; use `--json` for raw)
-- `cron add` (alias: `create`; requires `--name` and exactly one of `--at` | `--every` | `--cron`, and exactly one payload of `--system-event` | `--message`)
-- `cron edit <id>` (patch fields)
-- `cron rm <id>` (aliases: `remove`, `delete`)
-- `cron enable <id>`
-- `cron disable <id>`
-- `cron runs --id <id> [--limit <n>]`
-- `cron run <id> [--force]`
-
-All `cron` commands accept `--url`, `--token`, `--timeout`, `--expect-final`.
-
-## Node host
-
-`node` runs a **headless node host** or manages it as a background service. See
-[`clawdbot node`](/cli/node).
-
-Subcommands:
-- `node run --host <gateway-host> --port 18789`
-- `node status`
-- `node install [--host <gateway-host>] [--port <port>] [--tls] [--tls-fingerprint <sha256>] [--node-id <id>] [--display-name <name>] [--runtime <node|bun>] [--force]`
-- `node uninstall`
-- `node stop`
-- `node restart`
-
-## Nodes
-
-`nodes` talks to the Gateway and targets paired nodes. See [/nodes](/nodes).
-
-Common options:
-- `--url`, `--token`, `--timeout`, `--json`
-
-Subcommands:
-- `nodes status [--connected] [--last-connected <duration>]`
-- `nodes describe --node <id|name|ip>`
-- `nodes list [--connected] [--last-connected <duration>]`
-- `nodes pending`
-- `nodes approve <requestId>`
-- `nodes reject <requestId>`
-- `nodes rename --node <id|name|ip> --name <displayName>`
-- `nodes invoke --node <id|name|ip> --command <command> [--params <json>] [--invoke-timeout <ms>] [--idempotency-key <key>]`
-- `nodes run --node <id|name|ip> [--cwd <path>] [--env KEY=VAL] [--command-timeout <ms>] [--needs-screen-recording] [--invoke-timeout <ms>] <command...>` (mac node or headless node host)
-- `nodes notify --node <id|name|ip> [--title <text>] [--body <text>] [--sound <name>] [--priority <passive|active|timeSensitive>] [--delivery <system|overlay|auto>] [--invoke-timeout <ms>]` (mac only)
-
-Camera:
-- `nodes camera list --node <id|name|ip>`
-- `nodes camera snap --node <id|name|ip> [--facing front|back|both] [--device-id <id>] [--max-width <px>] [--quality <0-1>] [--delay-ms <ms>] [--invoke-timeout <ms>]`
-- `nodes camera clip --node <id|name|ip> [--facing front|back] [--device-id <id>] [--duration <ms|10s|1m>] [--no-audio] [--invoke-timeout <ms>]`
-
-Canvas + screen:
-- `nodes canvas snapshot --node <id|name|ip> [--format png|jpg|jpeg] [--max-width <px>] [--quality <0-1>] [--invoke-timeout <ms>]`
-- `nodes canvas present --node <id|name|ip> [--target <urlOrPath>] [--x <px>] [--y <px>] [--width <px>] [--height <px>] [--invoke-timeout <ms>]`
-- `nodes canvas hide --node <id|name|ip> [--invoke-timeout <ms>]`
-- `nodes canvas navigate <url> --node <id|name|ip> [--invoke-timeout <ms>]`
-- `nodes canvas eval [<js>] --node <id|name|ip> [--js <code>] [--invoke-timeout <ms>]`
-- `nodes canvas a2ui push --node <id|name|ip> (--jsonl <path> | --text <text>) [--invoke-timeout <ms>]`
-- `nodes canvas a2ui reset --node <id|name|ip> [--invoke-timeout <ms>]`
-- `nodes screen record --node <id|name|ip> [--screen <index>] [--duration <ms|10s>] [--fps <n>] [--no-audio] [--out <path>] [--invoke-timeout <ms>]`
-
-Location:
-- `nodes location get --node <id|name|ip> [--max-age <ms>] [--accuracy <coarse|balanced|precise>] [--location-timeout <ms>] [--invoke-timeout <ms>]`
-
-## Browser
-
-Browser control CLI (dedicated Chrome/Brave/Edge/Chromium). See [`clawdbot browser`](/cli/browser) and the [Browser tool](/tools/browser).
-
-Common options:
-- `--url`, `--token`, `--timeout`, `--json`
-- `--browser-profile <name>`
-
-Manage:
-- `browser status`
-- `browser start`
-- `browser stop`
-- `browser reset-profile`
-- `browser tabs`
-- `browser open <url>`
-- `browser focus <targetId>`
-- `browser close [targetId]`
-- `browser profiles`
-- `browser create-profile --name <name> [--color <hex>] [--cdp-url <url>]`
-- `browser delete-profile --name <name>`
-
-Inspect:
-- `browser screenshot [targetId] [--full-page] [--ref <ref>] [--element <selector>] [--type png|jpeg]`
-- `browser snapshot [--format aria|ai] [--target-id <id>] [--limit <n>] [--interactive] [--compact] [--depth <n>] [--selector <sel>] [--out <path>]`
-
-Actions:
-- `browser navigate <url> [--target-id <id>]`
-- `browser resize <width> <height> [--target-id <id>]`
-- `browser click <ref> [--double] [--button <left|right|middle>] [--modifiers <csv>] [--target-id <id>]`
-- `browser type <ref> <text> [--submit] [--slowly] [--target-id <id>]`
-- `browser press <key> [--target-id <id>]`
-- `browser hover <ref> [--target-id <id>]`
-- `browser drag <startRef> <endRef> [--target-id <id>]`
-- `browser select <ref> <values...> [--target-id <id>]`
-- `browser upload <paths...> [--ref <ref>] [--input-ref <ref>] [--element <selector>] [--target-id <id>] [--timeout-ms <ms>]`
-- `browser fill [--fields <json>] [--fields-file <path>] [--target-id <id>]`
-- `browser dialog --accept|--dismiss [--prompt <text>] [--target-id <id>] [--timeout-ms <ms>]`
-- `browser wait [--time <ms>] [--text <value>] [--text-gone <value>] [--target-id <id>]`
-- `browser evaluate --fn <code> [--ref <ref>] [--target-id <id>]`
-- `browser console [--level <error|warn|info>] [--target-id <id>]`
-- `browser pdf [--target-id <id>]`
-
-## Docs search
-
-### `docs [query...]`
-Search the live docs index.
-
-## TUI
-
-### `tui`
-Open the terminal UI connected to the Gateway.
-
-Options:
-- `--url <url>`
-- `--token <token>`
-- `--password <password>`
-- `--session <key>`
-- `--deliver`
-- `--thinking <level>`
-- `--message <text>`
-- `--timeout-ms <ms>` (defaults to `agents.defaults.timeoutSeconds`)
-- `--history-limit <n>`
+- [Slash commands](/tools/slash-commands)
+- [Configuration](/gateway/configuration)
+- [Environment](/help/environment)

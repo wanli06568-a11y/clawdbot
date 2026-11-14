@@ -1,16 +1,11 @@
-/**
- * Template interpolation for response prefix.
- *
- * Supports variables like `{model}`, `{provider}`, `{thinkingLevel}`, etc.
- * Variables are case-insensitive and unresolved ones remain as literal text.
- */
+// Resolves response-prefix templates for channel and sender scoped replies.
 
 export type ResponsePrefixContext = {
-  /** Short model name (e.g., "gpt-5.2", "claude-opus-4-5") */
+  /** Short model name (e.g., "gpt-5.4", "claude-opus-4-6") */
   model?: string;
-  /** Full model ID including provider (e.g., "openai-codex/gpt-5.2") */
+  /** Full model ID including provider. */
   modelFull?: string;
-  /** Provider name (e.g., "openai-codex", "anthropic") */
+  /** Provider name (e.g., "openai", "anthropic") */
   provider?: string;
   /** Current thinking level (e.g., "high", "low", "off") */
   thinkingLevel?: string;
@@ -20,78 +15,51 @@ export type ResponsePrefixContext = {
 
 // Regex pattern for template variables: {variableName} or {variable.name}
 const TEMPLATE_VAR_PATTERN = /\{([a-zA-Z][a-zA-Z0-9.]*)\}/g;
+const TEMPLATE_FIELDS: Readonly<Record<string, keyof ResponsePrefixContext>> = {
+  model: "model",
+  modelfull: "modelFull",
+  provider: "provider",
+  thinkinglevel: "thinkingLevel",
+  think: "thinkingLevel",
+  "identity.name": "identityName",
+  identityname: "identityName",
+};
 
-/**
- * Interpolate template variables in a response prefix string.
- *
- * @param template - The template string with `{variable}` placeholders
- * @param context - Context object with values for interpolation
- * @returns The interpolated string, or undefined if template is undefined
- *
- * @example
- * resolveResponsePrefixTemplate("[{model} | think:{thinkingLevel}]", {
- *   model: "gpt-5.2",
- *   thinkingLevel: "high"
- * })
- * // Returns: "[gpt-5.2 | think:high]"
- */
+/** Variable names are case-insensitive; unresolved placeholders remain literal. */
 export function resolveResponsePrefixTemplate(
   template: string | undefined,
   context: ResponsePrefixContext,
 ): string | undefined {
-  if (!template) return undefined;
+  if (!template) {
+    return undefined;
+  }
 
   return template.replace(TEMPLATE_VAR_PATTERN, (match, varName: string) => {
     const normalizedVar = varName.toLowerCase();
-
-    switch (normalizedVar) {
-      case "model":
-        return context.model ?? match;
-      case "modelfull":
-        return context.modelFull ?? match;
-      case "provider":
-        return context.provider ?? match;
-      case "thinkinglevel":
-      case "think":
-        return context.thinkingLevel ?? match;
-      case "identity.name":
-      case "identityname":
-        return context.identityName ?? match;
-      default:
-        // Leave unrecognized variables as-is
-        return match;
-    }
+    return Object.hasOwn(TEMPLATE_FIELDS, normalizedVar)
+      ? (context[TEMPLATE_FIELDS[normalizedVar]!] ?? match)
+      : match;
   });
 }
 
-/**
- * Extract short model name from a full model string.
- *
- * Strips:
- * - Provider prefix (e.g., "openai/" from "openai/gpt-5.2")
- * - Date suffixes (e.g., "-20251101" from "claude-opus-4-5-20251101")
- * - Common version suffixes (e.g., "-latest")
- *
- * @example
- * extractShortModelName("openai-codex/gpt-5.2") // "gpt-5.2"
- * extractShortModelName("claude-opus-4-5-20251101") // "claude-opus-4-5"
- * extractShortModelName("gpt-5.2-latest") // "gpt-5.2"
- */
-export function extractShortModelName(fullModel: string): string {
-  // Strip provider prefix
+/** Projects a run's selected model into the template fields replies and tool sends share. */
+export function resolveModelResponsePrefixContext(params: {
+  provider: string;
+  model: string;
+  thinkLevel?: string;
+}): ResponsePrefixContext {
+  return {
+    provider: params.provider,
+    model: extractShortModelName(params.model),
+    modelFull: `${params.provider}/${params.model}`,
+    thinkingLevel: params.thinkLevel,
+  };
+}
+
+/** Strips the provider prefix, date suffix, and trailing -latest tag for display. */
+function extractShortModelName(fullModel: string): string {
   const slash = fullModel.lastIndexOf("/");
   const modelPart = slash >= 0 ? fullModel.slice(slash + 1) : fullModel;
 
-  // Strip date suffixes (YYYYMMDD format)
   return modelPart.replace(/-\d{8}$/, "").replace(/-latest$/, "");
-}
-
-/**
- * Check if a template string contains any template variables.
- */
-export function hasTemplateVariables(template: string | undefined): boolean {
-  if (!template) return false;
-  // Reset lastIndex since we're using a global regex
-  TEMPLATE_VAR_PATTERN.lastIndex = 0;
-  return TEMPLATE_VAR_PATTERN.test(template);
 }

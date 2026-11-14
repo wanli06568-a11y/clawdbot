@@ -1,15 +1,17 @@
-import os from "node:os";
 import path from "node:path";
-import { DEFAULT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
-import { resolveUserPath } from "../utils.js";
-import { resolveStateDir } from "./paths.js";
-import type { ClawdbotConfig } from "./types.js";
+import { resolvePathPrefixSync } from "@openclaw/fs-safe/advanced";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { listAgentEntries, resolveEffectiveAgentDir } from "../agents/agent-scope-config.js";
+import { isPathCaseInsensitive } from "../infra/path-case.js";
+import { normalizeAgentId } from "../routing/session-key.js";
+import type { OpenClawConfig } from "./types.js";
 
-export type DuplicateAgentDir = {
+type DuplicateAgentDir = {
   agentDir: string;
   agentIds: string[];
 };
 
+/** Error thrown when multiple configured agents resolve to the same state directory. */
 export class DuplicateAgentDirError extends Error {
   readonly duplicates: DuplicateAgentDir[];
 
@@ -20,24 +22,25 @@ export class DuplicateAgentDirError extends Error {
   }
 }
 
-function canonicalizeAgentDir(agentDir: string): string {
+function resolveAgentDirIdentity(agentDir: string): string {
   const resolved = path.resolve(agentDir);
-  if (process.platform === "darwin" || process.platform === "win32") {
-    return resolved.toLowerCase();
+  try {
+    const prefix = resolvePathPrefixSync(resolved);
+    return path.join(prefix.existingPath, ...prefix.unresolvedSegments);
+  } catch {
+    // Unreadable paths keep their configured spelling for best-effort comparison.
+    return resolved;
   }
-  return resolved;
 }
 
-function collectReferencedAgentIds(cfg: ClawdbotConfig): string[] {
+function collectReferencedAgentIds(cfg: OpenClawConfig): string[] {
   const ids = new Set<string>();
 
-  const agents = Array.isArray(cfg.agents?.list) ? cfg.agents?.list : [];
-  const defaultAgentId =
-    agents.find((agent) => agent?.default)?.id ?? agents[0]?.id ?? DEFAULT_AGENT_ID;
-  ids.add(normalizeAgentId(defaultAgentId));
-
+  const agents = listAgentEntries(cfg);
   for (const entry of agents) {
-    if (entry?.id) ids.add(normalizeAgentId(entry.id));
+    if (entry?.id) {
+      ids.add(normalizeAgentId(entry.id));
+    }
   }
 
   const bindings = cfg.bindings;
@@ -53,30 +56,31 @@ function collectReferencedAgentIds(cfg: ClawdbotConfig): string[] {
   return [...ids];
 }
 
-function resolveEffectiveAgentDir(
-  cfg: ClawdbotConfig,
-  agentId: string,
-  deps?: { env?: NodeJS.ProcessEnv; homedir?: () => string },
-): string {
-  const id = normalizeAgentId(agentId);
-  const configured = Array.isArray(cfg.agents?.list)
-    ? cfg.agents?.list.find((agent) => normalizeAgentId(agent.id) === id)?.agentDir
-    : undefined;
-  const trimmed = configured?.trim();
-  if (trimmed) return resolveUserPath(trimmed);
-  const root = resolveStateDir(deps?.env ?? process.env, deps?.homedir ?? os.homedir);
-  return path.join(root, "agents", id, "agent");
-}
-
+/** Finds agent ids whose effective agentDir would share auth/session state. */
 export function findDuplicateAgentDirs(
-  cfg: ClawdbotConfig,
+  cfg: OpenClawConfig,
   deps?: { env?: NodeJS.ProcessEnv; homedir?: () => string },
 ): DuplicateAgentDir[] {
+  const agentIds = collectReferencedAgentIds(cfg);
+  if (agentIds.length < 2) {
+    return [];
+  }
+  const dirs = agentIds.map((agentId) => {
+    const agentDir = resolveEffectiveAgentDir(cfg, agentId, deps);
+    const resolved = resolveAgentDirIdentity(agentDir);
+    return { agentId, agentDir, resolved, folded: normalizeLowercaseStringOrEmpty(resolved) };
+  });
+  // Folding can only merge paths that are equal ignoring case, so the sync
+  // filesystem case probe runs only for those candidates, not for every agent.
+  const foldedCounts = new Map<string, number>();
+  for (const { folded } of dirs) {
+    foldedCounts.set(folded, (foldedCounts.get(folded) ?? 0) + 1);
+  }
   const byDir = new Map<string, { agentDir: string; agentIds: string[] }>();
 
-  for (const agentId of collectReferencedAgentIds(cfg)) {
-    const agentDir = resolveEffectiveAgentDir(cfg, agentId, deps);
-    const key = canonicalizeAgentDir(agentDir);
+  for (const { agentId, agentDir, resolved, folded } of dirs) {
+    const key =
+      (foldedCounts.get(folded) ?? 0) > 1 && isPathCaseInsensitive(resolved) ? folded : resolved;
     const entry = byDir.get(key);
     if (entry) {
       entry.agentIds.push(agentId);
@@ -88,6 +92,7 @@ export function findDuplicateAgentDirs(
   return [...byDir.values()].filter((v) => v.agentIds.length > 1);
 }
 
+/** Formats duplicate agentDir conflicts with the remediation operators should take. */
 export function formatDuplicateAgentDirError(dups: DuplicateAgentDir[]): string {
   const lines: string[] = [
     "Duplicate agentDir detected (multi-agent config).",
@@ -96,8 +101,8 @@ export function formatDuplicateAgentDirError(dups: DuplicateAgentDir[]): string 
     "Conflicts:",
     ...dups.map((d) => `- ${d.agentDir}: ${d.agentIds.map((id) => `"${id}"`).join(", ")}`),
     "",
-    "Fix: remove the shared agents.list[].agentDir override (or give each agent its own directory).",
-    "If you want to share credentials, copy auth-profiles.json instead of sharing the entire agentDir.",
+    "Fix: remove the shared agents.entries.*.agentDir override (or give each agent its own directory).",
+    "Auth profiles live in each agent's SQLite store, so a shared agentDir is not how credentials are shared: give each agent its own directory and either leave its store empty to inherit the main agent's profiles, or log it in with `openclaw models auth login`.",
   ];
   return lines.join("\n");
 }

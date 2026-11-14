@@ -1,158 +1,122 @@
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
+import * as cliArgv from "./argv.js";
 
-import {
-  buildParseArgv,
-  getFlagValue,
-  getCommandPath,
-  getPrimaryCommand,
-  getPositiveIntFlagValue,
-  getVerboseFlag,
-  hasHelpOrVersion,
-  hasFlag,
-  shouldMigrateState,
-  shouldMigrateStateFromPath,
-} from "./argv.js";
+const cli = (args: string) => ["node", "openclaw", ...args.split(" ")];
 
-describe("argv helpers", () => {
-  it("detects help/version flags", () => {
-    expect(hasHelpOrVersion(["node", "clawdbot", "--help"])).toBe(true);
-    expect(hasHelpOrVersion(["node", "clawdbot", "-V"])).toBe(true);
-    expect(hasHelpOrVersion(["node", "clawdbot", "status"])).toBe(false);
-  });
+it.each([
+  ["--profile work backup help -h", "--profile work backup help"],
+  ["docs help --help"],
+  ["plugins help list --help", "plugins list --help"],
+  ["backup help -- --help"],
+  ["plugins help -- list", "plugins list --help"],
+  ["plugins help list -- --help"],
+])("normalizes generated help commands: %s", (argv, expected = argv) => {
+  expect(cliArgv.normalizeGeneratedHelpCommandArgv(cli(argv))).toEqual(cli(expected));
+});
 
-  it("extracts command path ignoring flags and terminator", () => {
-    expect(getCommandPath(["node", "clawdbot", "status", "--json"], 2)).toEqual(["status"]);
-    expect(getCommandPath(["node", "clawdbot", "agents", "list"], 2)).toEqual(["agents", "list"]);
-    expect(getCommandPath(["node", "clawdbot", "status", "--", "ignored"], 2)).toEqual(["status"]);
-  });
+it.each([
+  ["help --help"],
+  ["help plugins list --help", "plugins list --help"],
+  ["help plugins -- list", "plugins list --help"],
+  ["help plugins list -- --profile work"],
+])("normalizes root help targets: %s", (argv, expected = argv) => {
+  expect(cliArgv.normalizeRootHelpTargetArgv(cli(argv))).toEqual(cli(expected));
+});
 
-  it("returns primary command", () => {
-    expect(getPrimaryCommand(["node", "clawdbot", "agents", "list"])).toBe("agents");
-    expect(getPrimaryCommand(["node", "clawdbot"])).toBeNull();
-  });
+it("allows final command metadata to lift no-color after boolean command flags", () => {
+  expect(
+    cliArgv.normalizeRootNoColorArgv(cli("doctor --lint --json --no-color"), {
+      shouldPreserveNoColor: ({ remainingArgs, noColorIndex }) =>
+        remainingArgs[noColorIndex - 1] === "--message",
+    }),
+  ).toEqual(cli("--no-color doctor --lint --json"));
+});
 
-  it("parses boolean flags and ignores terminator", () => {
-    expect(hasFlag(["node", "clawdbot", "status", "--json"], "--json")).toBe(true);
-    expect(hasFlag(["node", "clawdbot", "--", "--json"], "--json")).toBe(false);
-  });
+it.each([
+  ["doctor --log-level=trace --json", "--log-level=trace doctor --json"],
+  ["--profile work doctor --log-level debug", "--profile work --log-level debug doctor"],
+  ["agent --message --log-level debug"],
+  ["nodes run -- --log-level debug"],
+  ["doctor --log-level --json"],
+])("normalizes root --log-level before command parsing: %s", (argv, expected = argv) => {
+  expect(cliArgv.normalizeRootLogLevelArgv(cli(argv))).toEqual(cli(expected));
+});
 
-  it("extracts flag values with equals and missing values", () => {
-    expect(getFlagValue(["node", "clawdbot", "status", "--timeout", "5000"], "--timeout")).toBe(
-      "5000",
-    );
-    expect(getFlagValue(["node", "clawdbot", "status", "--timeout=2500"], "--timeout")).toBe(
-      "2500",
-    );
-    expect(getFlagValue(["node", "clawdbot", "status", "--timeout"], "--timeout")).toBeNull();
-    expect(getFlagValue(["node", "clawdbot", "status", "--timeout", "--json"], "--timeout")).toBe(
-      null,
-    );
-    expect(getFlagValue(["node", "clawdbot", "--", "--timeout=99"], "--timeout")).toBeUndefined();
-  });
+it("preserves log-level when final command metadata owns the option", () => {
+  const argv = cli("plugin-cmd --log-level debug");
 
-  it("parses verbose flags", () => {
-    expect(getVerboseFlag(["node", "clawdbot", "status", "--verbose"])).toBe(true);
-    expect(getVerboseFlag(["node", "clawdbot", "status", "--debug"])).toBe(false);
-    expect(getVerboseFlag(["node", "clawdbot", "status", "--debug"], { includeDebug: true })).toBe(
-      true,
-    );
-  });
+  expect(
+    cliArgv.normalizeRootLogLevelArgv(argv, {
+      shouldPreserveLogLevel: ({ remainingArgs, logLevelIndex }) =>
+        remainingArgs[logLevelIndex] === "--log-level",
+    }),
+  ).toEqual(argv);
+});
 
-  it("parses positive integer flag values", () => {
-    expect(getPositiveIntFlagValue(["node", "clawdbot", "status"], "--timeout")).toBeUndefined();
-    expect(
-      getPositiveIntFlagValue(["node", "clawdbot", "status", "--timeout"], "--timeout"),
-    ).toBeNull();
-    expect(
-      getPositiveIntFlagValue(["node", "clawdbot", "status", "--timeout", "5000"], "--timeout"),
-    ).toBe(5000);
-    expect(
-      getPositiveIntFlagValue(["node", "clawdbot", "status", "--timeout", "nope"], "--timeout"),
-    ).toBeUndefined();
-  });
+it.each([
+  ["external-plugin tools help", true],
+  ["agent --message help", false],
+  ["nodes invoke -- help", false],
+  ["-- help config", true],
+  ["config -- help", true],
+  ["--version", true],
+] as const)("detects help/version invocations: %s", (argv, expected) => {
+  expect(cliArgv.isHelpOrVersionInvocation(cli(argv))).toBe(expected);
+});
 
-  it("builds parse argv from raw args", () => {
-    const nodeArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["node", "clawdbot", "status"],
-    });
-    expect(nodeArgv).toEqual(["node", "clawdbot", "status"]);
+it("detects root-only version invocations with a profile", () => {
+  expect(cliArgv.isRootVersionInvocation(cli("--profile work -v"))).toBe(true);
+});
 
-    const versionedNodeArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["node-22", "clawdbot", "status"],
-    });
-    expect(versionedNodeArgv).toEqual(["node-22", "clawdbot", "status"]);
+it("limits simple help fast paths to root options, a command, and help", () => {
+  const commands = new Set(["setup"]);
+  expect(cliArgv.isSimpleCommandHelpInvocation(cli("--profile work setup --help"), commands)).toBe(
+    true,
+  );
+  expect(cliArgv.isSimpleCommandHelpInvocation(cli("setup --workspace --help"), commands)).toBe(
+    false,
+  );
+  expect(cliArgv.isSimpleCommandHelpInvocation(cli("setup --profile work --help"), commands)).toBe(
+    false,
+  );
+  expect(cliArgv.isSimpleCommandHelpInvocation(cli("--help setup"), commands)).toBe(false);
+});
 
-    const versionedNodeWindowsArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["node-22.2.0.exe", "clawdbot", "status"],
-    });
-    expect(versionedNodeWindowsArgv).toEqual(["node-22.2.0.exe", "clawdbot", "status"]);
+it("returns null when routed command sees unknown options", () => {
+  expect(
+    cliArgv.getCommandPositionalsWithRootOptions(cli("config get --mystery value update.channel"), {
+      commandPath: ["config", "get"],
+      booleanFlags: ["--json"],
+    }),
+  ).toBeNull();
+});
 
-    const versionedNodePatchlessArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["node-22.2", "clawdbot", "status"],
-    });
-    expect(versionedNodePatchlessArgv).toEqual(["node-22.2", "clawdbot", "status"]);
+it("ignores boolean flags after the terminator", () => {
+  expect(cliArgv.hasFlag(cli("-- --json"), "--json")).toBe(false);
+});
 
-    const versionedNodeWindowsPatchlessArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["node-22.2.exe", "clawdbot", "status"],
-    });
-    expect(versionedNodeWindowsPatchlessArgv).toEqual(["node-22.2.exe", "clawdbot", "status"]);
+it.each([
+  ["-- --timeout=99", undefined],
+  ["status --timeout 100 --timeout=200", "200"],
+] as const)("extracts flag values: %s", (argv, expected) => {
+  expect(cliArgv.getFlagValue(cli(argv), "--timeout")).toBe(expected);
+});
 
-    const versionedNodeWithPathArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["/usr/bin/node-22.2.0", "clawdbot", "status"],
-    });
-    expect(versionedNodeWithPathArgv).toEqual(["/usr/bin/node-22.2.0", "clawdbot", "status"]);
+it("parses verbose flags", () => {
+  expect(cliArgv.getVerboseFlag(cli("status --verbose"))).toBe(true);
+  expect(cliArgv.getVerboseFlag(cli("status --debug"))).toBe(true);
+});
 
-    const nodejsArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["nodejs", "clawdbot", "status"],
-    });
-    expect(nodejsArgv).toEqual(["nodejs", "clawdbot", "status"]);
+it.each(["status --timeout", "status --timeout 0"])("rejects invalid integer: %s", (argv) => {
+  expect(cliArgv.getPositiveIntFlagValue(cli(argv), "--timeout")).toBeNull();
+});
 
-    const nonVersionedNodeArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["node-dev", "clawdbot", "status"],
-    });
-    expect(nonVersionedNodeArgv).toEqual(["node", "clawdbot", "node-dev", "clawdbot", "status"]);
-
-    const directArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["clawdbot", "status"],
-    });
-    expect(directArgv).toEqual(["node", "clawdbot", "status"]);
-
-    const bunArgv = buildParseArgv({
-      programName: "clawdbot",
-      rawArgs: ["bun", "src/entry.ts", "status"],
-    });
-    expect(bunArgv).toEqual(["bun", "src/entry.ts", "status"]);
-  });
-
-  it("builds parse argv from fallback args", () => {
-    const fallbackArgv = buildParseArgv({
-      programName: "clawdbot",
-      fallbackArgv: ["status"],
-    });
-    expect(fallbackArgv).toEqual(["node", "clawdbot", "status"]);
-  });
-
-  it("decides when to migrate state", () => {
-    expect(shouldMigrateState(["node", "clawdbot", "status"])).toBe(false);
-    expect(shouldMigrateState(["node", "clawdbot", "health"])).toBe(false);
-    expect(shouldMigrateState(["node", "clawdbot", "sessions"])).toBe(false);
-    expect(shouldMigrateState(["node", "clawdbot", "memory", "status"])).toBe(false);
-    expect(shouldMigrateState(["node", "clawdbot", "agent", "--message", "hi"])).toBe(false);
-    expect(shouldMigrateState(["node", "clawdbot", "agents", "list"])).toBe(true);
-    expect(shouldMigrateState(["node", "clawdbot", "message", "send"])).toBe(true);
-  });
-
-  it("reuses command path for migrate state decisions", () => {
-    expect(shouldMigrateStateFromPath(["status"])).toBe(false);
-    expect(shouldMigrateStateFromPath(["agents", "list"])).toBe(true);
-  });
+it.each([
+  [["openclaw", "status"], cli("status")],
+  [
+    ["bun", "src/entry.ts", "status"],
+    ["bun", "src/entry.ts", "status"],
+  ],
+] as const)("builds parse argv from raw args: %j", (rawArgs, expected) => {
+  expect(cliArgv.buildParseArgv([...rawArgs])).toEqual([...expected]);
 });

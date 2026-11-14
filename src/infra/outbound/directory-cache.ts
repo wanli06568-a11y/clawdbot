@@ -1,61 +1,79 @@
-import type { ChannelDirectoryEntryKind, ChannelId } from "../../channels/plugins/types.js";
-import type { ClawdbotConfig } from "../../config/config.js";
+import { resolveNonNegativeIntegerOption } from "@openclaw/normalization-core/number-coercion";
+import type { ChannelDirectoryEntryKind, ChannelId } from "../../channels/plugins/types.public.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { monotonicNow } from "../../shared/monotonic-time.js";
+import { getOrCreateWeakOwnerMap } from "../../shared/weak-owner-map.js";
+import { pruneMapToMaxSize } from "../map-size.js";
 
 type CacheEntry<T> = {
   value: T;
   fetchedAt: number;
 };
 
-export type DirectoryCacheKey = {
+type DirectoryCacheKey = {
   channel: ChannelId;
   accountId?: string | null;
   kind: ChannelDirectoryEntryKind;
-  source: "cache" | "live";
   signature?: string | null;
+  query?: string | null;
 };
 
 export function buildDirectoryCacheKey(key: DirectoryCacheKey): string {
   const signature = key.signature ?? "default";
-  return `${key.channel}:${key.accountId ?? "default"}:${key.kind}:${key.source}:${signature}`;
+  return `${key.channel}:${key.accountId ?? "default"}:${key.kind}:${signature}:query:${key.query ?? ""}`;
 }
 
+/** TTL and capacity are scoped to a config object reference. */
 export class DirectoryCache<T> {
-  private readonly cache = new Map<string, CacheEntry<T>>();
-  private lastConfigRef: ClawdbotConfig | null = null;
+  private cachesByConfig = new WeakMap<OpenClawConfig, Map<string, CacheEntry<T>>>();
+  private readonly ttlMs: number;
+  private readonly maxSize: number;
 
-  constructor(private readonly ttlMs: number) {}
+  constructor(ttlMs: number, maxSize = 2000) {
+    this.ttlMs = resolveNonNegativeIntegerOption(ttlMs, 0);
+    this.maxSize = Math.max(1, resolveNonNegativeIntegerOption(maxSize, 2000));
+  }
 
-  get(key: string, cfg: ClawdbotConfig): T | undefined {
-    this.resetIfConfigChanged(cfg);
-    const entry = this.cache.get(key);
-    if (!entry) return undefined;
-    if (Date.now() - entry.fetchedAt > this.ttlMs) {
-      this.cache.delete(key);
-      return undefined;
+  get(key: string, cfg: OpenClawConfig): T | undefined {
+    const cache = getOrCreateWeakOwnerMap(this.cachesByConfig, cfg);
+    this.pruneExpired(cache, monotonicNow());
+    return cache.get(key)?.value;
+  }
+
+  set(key: string, value: T, cfg: OpenClawConfig): void {
+    const cache = getOrCreateWeakOwnerMap(this.cachesByConfig, cfg);
+    const now = monotonicNow();
+    this.pruneExpired(cache, now);
+    // Refresh insertion order so active keys are less likely to be evicted.
+    cache.delete(key);
+    cache.set(key, { value, fetchedAt: now });
+    pruneMapToMaxSize(cache, this.maxSize);
+  }
+
+  clearMatching(match: (key: string) => boolean, cfg: OpenClawConfig): void {
+    const cache = this.cachesByConfig.get(cfg);
+    if (!cache) {
+      return;
     }
-    return entry.value;
-  }
-
-  set(key: string, value: T, cfg: ClawdbotConfig): void {
-    this.resetIfConfigChanged(cfg);
-    this.cache.set(key, { value, fetchedAt: Date.now() });
-  }
-
-  clearMatching(match: (key: string) => boolean): void {
-    for (const key of this.cache.keys()) {
-      if (match(key)) this.cache.delete(key);
+    for (const key of cache.keys()) {
+      if (match(key)) {
+        cache.delete(key);
+      }
     }
   }
 
-  clear(cfg?: ClawdbotConfig): void {
-    this.cache.clear();
-    if (cfg) this.lastConfigRef = cfg;
+  clear(): void {
+    this.cachesByConfig = new WeakMap();
   }
 
-  private resetIfConfigChanged(cfg: ClawdbotConfig): void {
-    if (this.lastConfigRef && this.lastConfigRef !== cfg) {
-      this.cache.clear();
+  private pruneExpired(cache: Map<string, CacheEntry<T>>, now: number): void {
+    if (this.ttlMs <= 0) {
+      return;
     }
-    this.lastConfigRef = cfg;
+    for (const [cacheKey, entry] of cache) {
+      if (now - entry.fetchedAt >= this.ttlMs) {
+        cache.delete(cacheKey);
+      }
+    }
   }
 }

@@ -1,31 +1,58 @@
+// Covers diagnostic flag matching and normalization.
 import { describe, expect, it } from "vitest";
+import type { OpenClawConfig } from "../config/config.js";
+import { isDiagnosticFlagEnabled } from "./diagnostic-flags.js";
 
-import type { ClawdbotConfig } from "../config/config.js";
-import { isDiagnosticFlagEnabled, resolveDiagnosticFlags } from "./diagnostic-flags.js";
-
-describe("diagnostic flags", () => {
-  it("merges config + env flags", () => {
+describe("isDiagnosticFlagEnabled", () => {
+  it("treats blank env values as no extra flags", () => {
     const cfg = {
-      diagnostics: { flags: ["telegram.http", "cache.*"] },
-    } as ClawdbotConfig;
-    const env = {
-      CLAWDBOT_DIAGNOSTICS: "foo,bar",
-    } as NodeJS.ProcessEnv;
+      diagnostics: { flags: ["telegram.http"] },
+    } as OpenClawConfig;
 
-    const flags = resolveDiagnosticFlags(cfg, env);
-    expect(flags).toEqual(expect.arrayContaining(["telegram.http", "cache.*", "foo", "bar"]));
-    expect(isDiagnosticFlagEnabled("telegram.http", cfg, env)).toBe(true);
-    expect(isDiagnosticFlagEnabled("cache.hit", cfg, env)).toBe(true);
-    expect(isDiagnosticFlagEnabled("foo", cfg, env)).toBe(true);
+    expect(
+      isDiagnosticFlagEnabled("telegram.http", cfg, {
+        OPENCLAW_DIAGNOSTICS: "   ",
+      } as NodeJS.ProcessEnv),
+    ).toBe(true);
   });
 
-  it("treats env true as wildcard", () => {
-    const env = { CLAWDBOT_DIAGNOSTICS: "1" } as NodeJS.ProcessEnv;
-    expect(isDiagnosticFlagEnabled("anything.here", undefined, env)).toBe(true);
+  it("treats false-like env values as disable overrides", () => {
+    const cfg = {
+      diagnostics: { flags: ["telegram.http"] },
+    } as OpenClawConfig;
+
+    for (const raw of ["0", "false", "off", "none"]) {
+      expect(
+        isDiagnosticFlagEnabled("telegram.http", cfg, {
+          OPENCLAW_DIAGNOSTICS: raw,
+        } as NodeJS.ProcessEnv),
+      ).toBe(false);
+    }
+  });
+});
+
+describe("diagnostic flag patterns", () => {
+  it("matches exact, namespace, prefix, and wildcard rules", () => {
+    for (const [flag, pattern] of [
+      ["telegram.http", "telegram.http"],
+      ["cache", "cache.*"],
+      ["cache.hit", "cache.*"],
+      ["tool.exec.fast", "tool.exec*"],
+      ["anything", "all"],
+      ["anything", "*"],
+    ] as const) {
+      expect(isDiagnosticFlagEnabled(flag, undefined, { OPENCLAW_DIAGNOSTICS: pattern })).toBe(
+        true,
+      );
+    }
   });
 
-  it("treats env false as disabled", () => {
-    const env = { CLAWDBOT_DIAGNOSTICS: "0" } as NodeJS.ProcessEnv;
-    expect(isDiagnosticFlagEnabled("telegram.http", undefined, env)).toBe(false);
+  it("rejects blank and non-matching flags", () => {
+    expect(isDiagnosticFlagEnabled("   ", undefined, { OPENCLAW_DIAGNOSTICS: "*" })).toBe(false);
+    expect(
+      isDiagnosticFlagEnabled("cache.hit", undefined, {
+        OPENCLAW_DIAGNOSTICS: "cache.miss,tool.*",
+      }),
+    ).toBe(false);
   });
 });

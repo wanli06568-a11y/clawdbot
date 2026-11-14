@@ -1,88 +1,122 @@
-// swift-tools-version: 6.2
-// Package manifest for the Clawdbot macOS companion (menu bar app + IPC library).
+// swift-tools-version: 6.3
+// Package manifest for the OpenClaw macOS companion (menu bar app + IPC library).
 
 import PackageDescription
 
 let package = Package(
-    name: "Clawdbot",
+    name: "OpenClaw",
     platforms: [
-        .macOS(.v15),
+        .macOS("26.2"),
     ],
     products: [
-        .library(name: "ClawdbotIPC", targets: ["ClawdbotIPC"]),
-        .library(name: "ClawdbotDiscovery", targets: ["ClawdbotDiscovery"]),
-        .executable(name: "Clawdbot", targets: ["Clawdbot"]),
-        .executable(name: "clawdbot-mac", targets: ["ClawdbotMacCLI"]),
+        .library(name: "OpenClawIPC", targets: ["OpenClawIPC"]),
+        .library(name: "OpenClawDiscovery", targets: ["OpenClawDiscovery"]),
+        .executable(name: "OpenClaw", targets: ["OpenClaw"]),
+        .executable(name: "openclaw-mac", targets: ["OpenClawMacCLI"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/orchetect/MenuBarExtraAccess", exact: "1.2.2"),
-        .package(url: "https://github.com/swiftlang/swift-subprocess.git", from: "0.1.0"),
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.8.0"),
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.8.1"),
-        .package(url: "https://github.com/steipete/Peekaboo.git", branch: "main"),
-        .package(path: "../shared/ClawdbotKit"),
-        .package(path: "../../Swabble"),
+        .package(url: "https://github.com/sindresorhus/KeyboardShortcuts", exact: "3.1.0"),
+        .package(url: "https://github.com/swiftlang/swift-subprocess.git", from: "1.0.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.15.1"),
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1"),
+        .package(url: "https://github.com/openclaw/Peekaboo.git", exact: "4.9.6"),
+        .package(url: "https://github.com/pointfreeco/swift-concurrency-extras", from: "1.4.1"),
+        .package(path: "../shared/OpenClawKit"),
+        .package(path: "../shared/OpenClawMLXTTSProtocol"),
+        .package(path: "../swabble"),
     ],
     targets: [
         .target(
-            name: "ClawdbotIPC",
-            dependencies: [],
+            name: "OpenClawCameraPTZNative",
+            path: "Sources/OpenClawCameraPTZNative",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("IOKit"),
+            ]),
+        .target(
+            name: "OpenClawIPC",
+            dependencies: [.product(name: "OpenClawNativeState", package: "OpenClawKit")],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),
         .target(
-            name: "ClawdbotDiscovery",
+            name: "OpenClawDiscovery",
             dependencies: [
-                .product(name: "ClawdbotKit", package: "ClawdbotKit"),
+                .product(name: "OpenClawKit", package: "OpenClawKit"),
+                .product(name: "Subprocess", package: "swift-subprocess"),
             ],
-            path: "Sources/ClawdbotDiscovery",
+            path: "Sources/OpenClawDiscovery",
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),
         .executableTarget(
-            name: "Clawdbot",
+            name: "OpenClaw",
             dependencies: [
-                "ClawdbotIPC",
-                "ClawdbotDiscovery",
-                .product(name: "ClawdbotKit", package: "ClawdbotKit"),
-                .product(name: "ClawdbotChatUI", package: "ClawdbotKit"),
-                .product(name: "ClawdbotProtocol", package: "ClawdbotKit"),
+                "OpenClawIPC",
+                "OpenClawDiscovery",
+                "OpenClawCameraPTZNative",
+                .product(name: "OpenClawNativeState", package: "OpenClawKit"),
+                .product(name: "OpenClawKit", package: "OpenClawKit"),
+                .product(name: "OpenClawChatUI", package: "OpenClawKit"),
+                .product(name: "OpenClawMLXTTSProtocol", package: "OpenClawMLXTTSProtocol"),
+                .product(name: "OpenClawProtocol", package: "OpenClawKit"),
                 .product(name: "SwabbleKit", package: "swabble"),
-                .product(name: "MenuBarExtraAccess", package: "MenuBarExtraAccess"),
                 .product(name: "Subprocess", package: "swift-subprocess"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "PeekabooBridge", package: "Peekaboo"),
                 .product(name: "PeekabooAutomationKit", package: "Peekaboo"),
+                .product(name: "ConcurrencyExtras", package: "swift-concurrency-extras"),
+                .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
             ],
             exclude: [
                 "Resources/Info.plist",
+                "Resources/Localizable.xcstrings",
             ],
             resources: [
-                .copy("Resources/Clawdbot.icns"),
+                .copy("Resources/OpenClaw.icns"),
+                .copy("Resources/NativeSessionCatalogs.json"),
+                .copy("Resources/AppIcons"),
                 .copy("Resources/DeviceModels"),
+                .copy("Resources/ProviderIcons"),
             ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),
         .executableTarget(
-            name: "ClawdbotMacCLI",
+            name: "OpenClawMacCLI",
             dependencies: [
-                "ClawdbotDiscovery",
-                .product(name: "ClawdbotKit", package: "ClawdbotKit"),
-                .product(name: "ClawdbotProtocol", package: "ClawdbotKit"),
+                "OpenClawIPC",
+                "OpenClawDiscovery",
+                .product(name: "OpenClawNativeState", package: "OpenClawKit"),
+                .product(name: "OpenClawKit", package: "OpenClawKit"),
+                .product(name: "OpenClawProtocol", package: "OpenClawKit"),
             ],
-            path: "Sources/ClawdbotMacCLI",
+            path: "Sources/OpenClawMacCLI",
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),
+        .target(
+            name: "OpenClawWebKitTestSupport",
+            path: "Tests/OpenClawWebKitTestSupport",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("WebKit"),
+            ]),
         .testTarget(
-            name: "ClawdbotIPCTests",
+            name: "OpenClawIPCTests",
             dependencies: [
-                "ClawdbotIPC",
-                "Clawdbot",
-                "ClawdbotDiscovery",
-                .product(name: "ClawdbotProtocol", package: "ClawdbotKit"),
+                "OpenClawIPC",
+                .product(name: "OpenClawNativeState", package: "OpenClawKit"),
+                "OpenClaw",
+                "OpenClawMacCLI",
+                "OpenClawDiscovery",
+                "OpenClawWebKitTestSupport",
+                .product(name: "OpenClawChatUI", package: "OpenClawKit"),
+                .product(name: "OpenClawKit", package: "OpenClawKit"),
+                .product(name: "OpenClawMLXTTSProtocol", package: "OpenClawMLXTTSProtocol"),
+                .product(name: "OpenClawProtocol", package: "OpenClawKit"),
                 .product(name: "SwabbleKit", package: "swabble"),
             ],
             swiftSettings: [

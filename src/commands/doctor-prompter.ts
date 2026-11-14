@@ -1,96 +1,97 @@
-import { confirm, select } from "@clack/prompts";
-
+import { confirm, select, type SelectOptions } from "@clack/prompts";
+import { styleSelectParams } from "../../packages/terminal-core/src/prompt-select-styled-params.js";
+import { stylePromptMessage } from "../../packages/terminal-core/src/prompt-style.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { stylePromptHint, stylePromptMessage } from "../terminal/prompt-style.js";
+import { resolveDoctorRepairMode, shouldAutoApproveDoctorFix } from "./doctor-repair-mode.js";
+import type { DoctorOptions } from "./doctor.types.js";
 import { guardCancel } from "./onboard-helpers.js";
 
-export type DoctorOptions = {
-  workspaceSuggestions?: boolean;
-  yes?: boolean;
-  nonInteractive?: boolean;
-  deep?: boolean;
-  repair?: boolean;
-  force?: boolean;
-  generateGatewayToken?: boolean;
+export type { DoctorOptions } from "./doctor.types.js";
+
+type DoctorConfirmParams = Parameters<typeof confirm>[0];
+type DoctorRuntimeRepairConfirmParams = DoctorConfirmParams & {
+  requiresInteractiveConfirmation?: boolean;
 };
 
-export type DoctorPrompter = {
-  confirm: (params: Parameters<typeof confirm>[0]) => Promise<boolean>;
-  confirmRepair: (params: Parameters<typeof confirm>[0]) => Promise<boolean>;
-  confirmAggressive: (params: Parameters<typeof confirm>[0]) => Promise<boolean>;
-  confirmSkipInNonInteractive: (params: Parameters<typeof confirm>[0]) => Promise<boolean>;
-  select: <T>(params: Parameters<typeof select>[0], fallback: T) => Promise<T>;
-  shouldRepair: boolean;
-  shouldForce: boolean;
-};
+export type DoctorPrompter = ReturnType<typeof createDoctorPrompter>;
 
 export function createDoctorPrompter(params: {
   runtime: RuntimeEnv;
   options: DoctorOptions;
-}): DoctorPrompter {
-  const yes = params.options.yes === true;
-  const requestedNonInteractive = params.options.nonInteractive === true;
-  const shouldRepair = params.options.repair === true || yes;
-  const shouldForce = params.options.force === true;
-  const isTty = Boolean(process.stdin.isTTY);
-  const nonInteractive = requestedNonInteractive || (!isTty && !yes);
-
-  const canPrompt = isTty && !yes && !nonInteractive;
-  const confirmDefault = async (p: Parameters<typeof confirm>[0]) => {
-    if (nonInteractive) return false;
-    if (shouldRepair) return true;
-    if (!canPrompt) return Boolean(p.initialValue ?? false);
-    return (
-      guardCancel(
-        await confirm({
-          ...p,
-          message: stylePromptMessage(p.message),
-        }),
-        params.runtime,
-      ) === true
-    );
+  signal?: AbortSignal;
+}) {
+  const repairMode = resolveDoctorRepairMode(params.options);
+  const confirmPrompt = async (p: DoctorConfirmParams) => {
+    if (params.signal?.aborted || repairMode.nonInteractive) {
+      return false;
+    }
+    if (!repairMode.canPrompt) {
+      return p.initialValue ?? false;
+    }
+    // Exit 130 (SIGINT convention) so the installer can distinguish
+    // user cancellation from normal doctor failures.
+    const answer = await confirm({
+      ...p,
+      signal: params.signal
+        ? p.signal
+          ? AbortSignal.any([p.signal, params.signal])
+          : params.signal
+        : p.signal,
+      message: stylePromptMessage(p.message),
+    });
+    // Maintenance interruption declines new consent without abandoning restoration.
+    return params.signal?.aborted ? false : guardCancel(answer, params.runtime, 130);
+  };
+  const confirmDefault = async (p: DoctorConfirmParams) => {
+    if (shouldAutoApproveDoctorFix(repairMode)) {
+      return true;
+    }
+    return confirmPrompt(p);
   };
 
   return {
     confirm: confirmDefault,
-    confirmRepair: async (p) => {
-      if (nonInteractive) return false;
-      return confirmDefault(p);
+    confirmAutoFix: confirmDefault,
+    confirmAggressiveAutoFix: async (p: DoctorConfirmParams) => {
+      if (shouldAutoApproveDoctorFix(repairMode, { requiresForce: true })) {
+        return true;
+      }
+      if (repairMode.shouldRepair && !repairMode.shouldForce) {
+        return false;
+      }
+      return confirmPrompt(p);
     },
-    confirmAggressive: async (p) => {
-      if (nonInteractive) return false;
-      if (shouldRepair && shouldForce) return true;
-      if (shouldRepair && !shouldForce) return false;
-      if (!canPrompt) return Boolean(p.initialValue ?? false);
-      return (
-        guardCancel(
-          await confirm({
-            ...p,
-            message: stylePromptMessage(p.message),
-          }),
-          params.runtime,
-        ) === true
-      );
-    },
-    confirmSkipInNonInteractive: async (p) => {
-      if (nonInteractive) return false;
-      if (shouldRepair) return true;
-      return confirmDefault(p);
+    confirmRuntimeRepair: async (p: DoctorRuntimeRepairConfirmParams) => {
+      const { requiresInteractiveConfirmation, ...confirmParams } = p;
+      if (
+        requiresInteractiveConfirmation !== true &&
+        shouldAutoApproveDoctorFix(repairMode, { blockDuringUpdate: true })
+      ) {
+        return true;
+      }
+      if (requiresInteractiveConfirmation === true && !repairMode.canPrompt) {
+        return false;
+      }
+      return confirmPrompt(confirmParams);
     },
     select: async <T>(p: Parameters<typeof select>[0], fallback: T) => {
-      if (!canPrompt || shouldRepair) return fallback;
-      return guardCancel(
-        await select({
-          ...p,
-          message: stylePromptMessage(p.message),
-          options: p.options.map((opt) =>
-            opt.hint === undefined ? opt : { ...opt, hint: stylePromptHint(opt.hint) },
-          ),
-        }),
-        params.runtime,
-      ) as T;
+      if (!repairMode.canPrompt || repairMode.shouldRepair) {
+        return fallback;
+      }
+      return guardCancel(await select(styleSelectParams(p)), params.runtime, 130) as T;
     },
-    shouldRepair,
-    shouldForce,
+    selectRuntimeRepair: async <T>(p: SelectOptions<T>, fallback: T | undefined) => {
+      // An ambiguous persisted identity requires an operator choice, including under --fix.
+      if (!repairMode.canPrompt || repairMode.updateInProgress || params.signal?.aborted) {
+        return fallback;
+      }
+      const answer = await select<T>(
+        styleSelectParams({ ...p, signal: params.signal ?? p.signal }),
+      );
+      return params.signal?.aborted ? fallback : guardCancel(answer, params.runtime, 130);
+    },
+    shouldRepair: repairMode.shouldRepair,
+    shouldForce: repairMode.shouldForce,
+    repairMode,
   };
 }

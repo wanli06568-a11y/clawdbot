@@ -1,22 +1,22 @@
 import Foundation
 import Testing
-@testable import Clawdbot
+@testable import OpenClaw
 
-@Suite struct VoiceWakeGatewaySyncTests {
-    @Test func decodeGatewayTriggersFromJSONSanitizes() {
-        let payload = #"{"triggers":[" clawd  ","", "computer"]}"#
-        let triggers = VoiceWakePreferences.decodeGatewayTriggers(from: payload)
-        #expect(triggers == ["clawd", "computer"])
+struct VoiceWakeGatewaySyncTests {
+    @Test func `decode gateway triggers from JSON sanitizes`() {
+        let payload = #"{"triggers":[" openclaw  ","", "computer"]}"#
+        let triggers = VoiceWakePreferences.decodeGatewayTriggers(from: Data(payload.utf8))
+        #expect(triggers == ["openclaw", "computer"])
     }
 
-    @Test func decodeGatewayTriggersFromJSONFallsBackWhenEmpty() {
+    @Test func `decode gateway triggers from JSON falls back when empty`() {
         let payload = #"{"triggers":["  ",""]}"#
-        let triggers = VoiceWakePreferences.decodeGatewayTriggers(from: payload)
+        let triggers = VoiceWakePreferences.decodeGatewayTriggers(from: Data(payload.utf8))
         #expect(triggers == VoiceWakePreferences.defaultTriggerWords)
     }
 
-    @Test func decodeGatewayTriggersFromInvalidJSONReturnsNil() {
-        let triggers = VoiceWakePreferences.decodeGatewayTriggers(from: "not json")
+    @Test func `decode gateway triggers from invalid JSON returns nil`() {
+        let triggers = VoiceWakePreferences.decodeGatewayTriggers(from: Data("not json".utf8))
         #expect(triggers == nil)
     }
 }

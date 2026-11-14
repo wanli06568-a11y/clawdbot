@@ -1,17 +1,17 @@
-# @clawdbot/twitch
+# @openclaw/twitch
 
-Twitch channel plugin for Clawdbot.
+Twitch channel plugin for OpenClaw.
 
 ## Install (local checkout)
 
 ```bash
-clawdbot plugins install ./extensions/twitch
+openclaw plugins install ./path/to/local/twitch-plugin
 ```
 
 ## Install (npm)
 
 ```bash
-clawdbot plugins install @clawdbot/twitch
+openclaw plugins install @openclaw/twitch
 ```
 
 Onboarding: select Twitch and confirm the install prompt to fetch the plugin automatically.
@@ -27,11 +27,11 @@ Minimal config (simplified single-account):
   channels: {
     twitch: {
       enabled: true,
-      username: "clawdbot",
+      username: "openclaw",
       accessToken: "oauth:abc123...", // OAuth Access Token (add oauth: prefix)
       clientId: "xyz789...", // Client ID from Token Generator
       channel: "vevisk", // Channel to join (required)
-      allowFrom: ["123456789"], // (recommended) Your Twitch user ID only (Convert your twitch username to ID at https://www.streamweasels.com/tools/convert-twitch-username-%20to-user-id/)
+      allowFrom: ["123456789"], // (recommended) Your Twitch user ID only (Convert your twitch username to ID at https://www.streamweasels.com/tools/convert-twitch-username-to-user-id/)
     },
   },
 }
@@ -52,13 +52,13 @@ Multi-account config (advanced):
       enabled: true,
       accounts: {
         default: {
-          username: "clawdbot",
+          username: "openclaw",
           accessToken: "oauth:abc123...",
           clientId: "xyz789...",
           channel: "vevisk",
         },
         channel2: {
-          username: "clawdbot",
+          username: "openclaw",
           accessToken: "oauth:def456...",
           clientId: "uvw012...",
           channel: "secondchannel",
@@ -74,13 +74,13 @@ Multi-account config (advanced):
 1. Create a dedicated Twitch account for the bot, then generate credentials: [Twitch Token Generator](https://twitchtokengenerator.com/)
    - Select **Bot Token**
    - Verify scopes `chat:read` and `chat:write` are selected
-   - Copy the **Access Token** to `token` property
+   - Copy the **Access Token** to `accessToken` property
    - Copy the **Client ID** to `clientId` property
 2. Start the gateway
 
 ## Full documentation
 
-See https://docs.clawd.bot/channels/twitch for:
+See https://docs.openclaw.ai/channels/twitch for:
 
 - Token refresh setup
 - Access control patterns

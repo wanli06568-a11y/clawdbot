@@ -1,272 +1,210 @@
 import fs from "node:fs";
 import path from "node:path";
-
-import type { ClawdbotConfig } from "../config/config.js";
+import { fileURLToPath } from "node:url";
+import { filterStringEntries } from "@openclaw/normalization-core/string-normalization";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { expandHomePrefix } from "../infra/home-dir.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { resolvePluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
+import { iteratePluginRootContributions } from "../plugins/plugin-root-contributions.js";
 import { CONFIG_DIR, resolveUserPath } from "../utils.js";
-import { resolveBundledHooksDir } from "./bundled-dir.js";
-import { shouldIncludeHook } from "./config.js";
 import {
-  parseFrontmatter,
-  resolveClawdbotMetadata,
-  resolveHookInvocationPolicy,
-} from "./frontmatter.js";
-import type {
-  Hook,
-  HookEligibilityContext,
-  HookEntry,
-  HookSnapshot,
-  HookSource,
-  ParsedHookFrontmatter,
-} from "./types.js";
+  loadHookEntriesFromDir,
+  type DiscoveredHookEntry,
+  type HookDiscoveryRoot,
+} from "./discovery.js";
+import { resolveHookEntries } from "./policy.js";
+import type { HookEntry, HookPolicyEntry } from "./types.js";
 
-type HookPackageManifest = {
-  name?: string;
-  clawdbot?: { hooks?: string[] };
+const log = createSubsystemLogger("hooks/workspace");
+
+export type HookSourceFact = HookPolicyEntry & { rootId: string; filePath: string };
+type HookCandidate = HookSourceFact & { entry?: DiscoveredHookEntry };
+type HookDiscoveryOptions = {
+  config?: OpenClawConfig;
+  managedHooksDir?: string;
+  bundledHooksDir?: string;
 };
 
-function filterHookEntries(
-  entries: HookEntry[],
-  config?: ClawdbotConfig,
-  eligibility?: HookEligibilityContext,
-): HookEntry[] {
-  return entries.filter((entry) => shouldIncludeHook({ entry, config, eligibility }));
-}
-
-function readHookPackageManifest(dir: string): HookPackageManifest | null {
-  const manifestPath = path.join(dir, "package.json");
-  if (!fs.existsSync(manifestPath)) return null;
-  try {
-    const raw = fs.readFileSync(manifestPath, "utf-8");
-    return JSON.parse(raw) as HookPackageManifest;
-  } catch {
-    return null;
-  }
-}
-
-function resolvePackageHooks(manifest: HookPackageManifest): string[] {
-  const raw = manifest.clawdbot?.hooks;
-  if (!Array.isArray(raw)) return [];
-  return raw.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
-}
-
-function loadHookFromDir(params: {
-  hookDir: string;
-  source: HookSource;
-  pluginId?: string;
-  nameHint?: string;
-}): Hook | null {
-  const hookMdPath = path.join(params.hookDir, "HOOK.md");
-  if (!fs.existsSync(hookMdPath)) return null;
-
-  try {
-    const content = fs.readFileSync(hookMdPath, "utf-8");
-    const frontmatter = parseFrontmatter(content);
-
-    const name = frontmatter.name || params.nameHint || path.basename(params.hookDir);
-    const description = frontmatter.description || "";
-
-    const handlerCandidates = ["handler.ts", "handler.js", "index.ts", "index.js"];
-    let handlerPath: string | undefined;
-    for (const candidate of handlerCandidates) {
-      const candidatePath = path.join(params.hookDir, candidate);
-      if (fs.existsSync(candidatePath)) {
-        handlerPath = candidatePath;
-        break;
-      }
-    }
-
-    if (!handlerPath) {
-      console.warn(`[hooks] Hook "${name}" has HOOK.md but no handler file in ${params.hookDir}`);
-      return null;
-    }
-
-    return {
-      name,
-      description,
-      source: params.source as Hook["source"],
-      pluginId: params.pluginId,
-      filePath: hookMdPath,
-      baseDir: params.hookDir,
-      handlerPath,
-    };
-  } catch (err) {
-    console.warn(`[hooks] Failed to load hook from ${params.hookDir}:`, err);
-    return null;
-  }
-}
-
-/**
- * Scan a directory for hooks (subdirectories containing HOOK.md)
- */
-function loadHooksFromDir(params: { dir: string; source: HookSource; pluginId?: string }): Hook[] {
-  const { dir, source, pluginId } = params;
-
-  if (!fs.existsSync(dir)) return [];
-
-  const stat = fs.statSync(dir);
-  if (!stat.isDirectory()) return [];
-
-  const hooks: Hook[] = [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-
-    const hookDir = path.join(dir, entry.name);
-    const manifest = readHookPackageManifest(hookDir);
-    const packageHooks = manifest ? resolvePackageHooks(manifest) : [];
-
-    if (packageHooks.length > 0) {
-      for (const hookPath of packageHooks) {
-        const resolvedHookDir = path.resolve(hookDir, hookPath);
-        const hook = loadHookFromDir({
-          hookDir: resolvedHookDir,
-          source,
-          pluginId,
-          nameHint: path.basename(resolvedHookDir),
-        });
-        if (hook) hooks.push(hook);
-      }
-      continue;
-    }
-
-    const hook = loadHookFromDir({
-      hookDir,
-      source,
-      pluginId,
-      nameHint: entry.name,
-    });
-    if (hook) hooks.push(hook);
+function resolveBundledHooksDir(): string | undefined {
+  const override = process.env.OPENCLAW_BUNDLED_HOOKS_DIR?.trim();
+  if (override) {
+    return override;
   }
 
-  return hooks;
-}
-
-export function loadHookEntriesFromDir(params: {
-  dir: string;
-  source: HookSource;
-  pluginId?: string;
-}): HookEntry[] {
-  const hooks = loadHooksFromDir({
-    dir: params.dir,
-    source: params.source,
-    pluginId: params.pluginId,
-  });
-  return hooks.map((hook) => {
-    let frontmatter: ParsedHookFrontmatter = {};
+  // Search compiled executables, npm packages, then source checkouts in that order.
+  for (const resolveCandidate of [
+    () => path.join(path.dirname(process.execPath), "hooks", "bundled"),
+    () => path.join(path.dirname(fileURLToPath(import.meta.url)), "bundled"),
+    () => path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../src/hooks/bundled"),
+  ]) {
     try {
-      const raw = fs.readFileSync(hook.filePath, "utf-8");
-      frontmatter = parseFrontmatter(raw);
+      const candidate = resolveCandidate();
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
     } catch {
-      // ignore malformed hooks
+      // A failed candidate does not prevent later installation layouts from resolving.
     }
-    const entry: HookEntry = {
-      hook: {
-        ...hook,
-        source: params.source,
-        pluginId: params.pluginId,
-      },
-      frontmatter,
-      clawdbot: resolveClawdbotMetadata(frontmatter),
-      invocation: resolveHookInvocationPolicy(frontmatter),
-    };
-    return entry;
-  });
+  }
+  return undefined;
 }
 
-function loadHookEntries(
+function resolvePluginHookDirs(params: {
+  workspaceDir: string | undefined;
+  config?: OpenClawConfig;
+}): HookDiscoveryRoot[] {
+  const workspaceDir = (params.workspaceDir ?? "").trim();
+  if (!workspaceDir) {
+    return [];
+  }
+  const metadataSnapshot = resolvePluginMetadataSnapshot({
+    workspaceDir,
+    config: params.config,
+    env: process.env,
+  });
+  const seen = new Set<string>();
+  const resolved: HookDiscoveryRoot[] = [];
+
+  for (const { record, roots } of iteratePluginRootContributions({
+    metadataSnapshot,
+    config: params.config,
+    contribution: "hooks",
+  })) {
+    for (const root of roots) {
+      const candidate = path.resolve(record.rootDir, root);
+      if (seen.has(candidate)) {
+        continue;
+      }
+      seen.add(candidate);
+      resolved.push({
+        dir: candidate,
+        pluginId: record.id,
+        rootDir: record.rootDir,
+        source: "openclaw-plugin",
+      });
+    }
+  }
+
+  return resolved;
+}
+
+function resolveHookDiscoveryRoots(
   workspaceDir: string,
-  opts?: {
-    config?: ClawdbotConfig;
-    managedHooksDir?: string;
-    bundledHooksDir?: string;
-  },
-): HookEntry[] {
-  const managedHooksDir = opts?.managedHooksDir ?? path.join(CONFIG_DIR, "hooks");
-  const workspaceHooksDir = path.join(workspaceDir, "hooks");
+  opts?: HookDiscoveryOptions,
+): HookDiscoveryRoot[] {
   const bundledHooksDir = opts?.bundledHooksDir ?? resolveBundledHooksDir();
-  const extraDirsRaw = opts?.config?.hooks?.internal?.load?.extraDirs ?? [];
-  const extraDirs = extraDirsRaw
-    .map((d) => (typeof d === "string" ? d.trim() : ""))
-    .filter(Boolean);
-
-  const bundledHooks = bundledHooksDir
-    ? loadHooksFromDir({
-        dir: bundledHooksDir,
-        source: "clawdbot-bundled",
-      })
-    : [];
-  const extraHooks = extraDirs.flatMap((dir) => {
-    const resolved = resolveUserPath(dir);
-    return loadHooksFromDir({
-      dir: resolved,
-      source: "clawdbot-workspace", // Extra dirs treated as workspace
-    });
-  });
-  const managedHooks = loadHooksFromDir({
-    dir: managedHooksDir,
-    source: "clawdbot-managed",
-  });
-  const workspaceHooks = loadHooksFromDir({
-    dir: workspaceHooksDir,
-    source: "clawdbot-workspace",
-  });
-
-  const merged = new Map<string, Hook>();
-  // Precedence: extra < bundled < managed < workspace (workspace wins)
-  for (const hook of extraHooks) merged.set(hook.name, hook);
-  for (const hook of bundledHooks) merged.set(hook.name, hook);
-  for (const hook of managedHooks) merged.set(hook.name, hook);
-  for (const hook of workspaceHooks) merged.set(hook.name, hook);
-
-  return Array.from(merged.values()).map((hook) => {
-    let frontmatter: ParsedHookFrontmatter = {};
-    try {
-      const raw = fs.readFileSync(hook.filePath, "utf-8");
-      frontmatter = parseFrontmatter(raw);
-    } catch {
-      // ignore malformed hooks
-    }
-    return {
-      hook,
-      frontmatter,
-      clawdbot: resolveClawdbotMetadata(frontmatter),
-      invocation: resolveHookInvocationPolicy(frontmatter),
-    };
-  });
+  return [
+    ...filterStringEntries(opts?.config?.hooks?.internal?.load?.extraDirs)
+      .filter((dir) => dir.trim())
+      .map((dir) => {
+        // Resolve only the invocation base and home through the trimming resolver.
+        // The configured directory's whitespace belongs to its filesystem identity.
+        const expanded = dir.startsWith("~")
+          ? expandHomePrefix(dir, { home: resolveUserPath("~") })
+          : dir;
+        return {
+          dir: path.isAbsolute(expanded)
+            ? path.resolve(expanded)
+            : path.resolve(resolveUserPath("."), expanded),
+          source: "openclaw-managed" as const,
+          includeRoot: true,
+        };
+      }),
+    ...(bundledHooksDir ? [{ dir: bundledHooksDir, source: "openclaw-bundled" as const }] : []),
+    ...resolvePluginHookDirs({ workspaceDir, config: opts?.config }),
+    { dir: opts?.managedHooksDir ?? path.join(CONFIG_DIR, "hooks"), source: "openclaw-managed" },
+    { dir: path.join(workspaceDir, "hooks"), source: "openclaw-workspace" },
+  ];
 }
 
-export function buildWorkspaceHookSnapshot(
+/** Prepare source-policy facts separately from executable, freshly discovered handlers. */
+export function prepareWorkspaceHookEntries(
   workspaceDir: string,
-  opts?: {
-    config?: ClawdbotConfig;
-    managedHooksDir?: string;
-    bundledHooksDir?: string;
-    entries?: HookEntry[];
-    eligibility?: HookEligibilityContext;
-    snapshotVersion?: number;
+  opts?: HookDiscoveryOptions & {
+    previousSources?: HookSourceFact[];
+    requireValidHook?: (entry: HookPolicyEntry) => boolean;
   },
-): HookSnapshot {
-  const hookEntries = opts?.entries ?? loadHookEntries(workspaceDir, opts);
-  const eligible = filterHookEntries(hookEntries, opts?.config, opts?.eligibility);
-
+): { entries: HookEntry[]; sources: HookSourceFact[] } {
+  const candidates = resolveHookDiscoveryRoots(workspaceDir, opts).flatMap((root) => {
+    const rootId = JSON.stringify([
+      root.source,
+      path.resolve(root.dir),
+      root.pluginId,
+      Boolean(root.includeRoot),
+      root.rootDir,
+    ]);
+    const entries: HookCandidate[] = loadHookEntriesFromDir(root, log.warn).map((entry) => ({
+      rootId,
+      filePath: entry.hook.filePath,
+      hook: { name: entry.hook.name, source: entry.hook.source },
+      metadata: entry.metadata,
+      entry,
+    }));
+    for (const previous of opts?.previousSources ?? []) {
+      if (previous.rootId !== rootId) {
+        continue;
+      }
+      const index = entries.findIndex((candidate) => candidate.filePath === previous.filePath);
+      const entry = entries[index]?.entry;
+      if (entry && !entry.invalidMetadata && entry.metadata?.events.length) {
+        continue;
+      }
+      if (index >= 0) {
+        entries.splice(index, 1);
+      }
+      // A lost winner still shadows lower code. Its metadata can select an error
+      // or an intentional non-outcome, but can never supply executable handlers.
+      entries.push({ ...previous, entry });
+    }
+    return entries;
+  });
+  const resolved = resolveHookEntries(
+    opts?.requireValidHook ? candidates : candidates.filter(({ entry }) => entry?.hook.handlerPath),
+    {
+      onCollisionIgnored: ({ name, kept, ignored }) => {
+        log.warn(
+          `Ignoring ${ignored.hook.source} hook "${name}" because it cannot override ${kept.hook.source} hook code`,
+        );
+      },
+    },
+  );
+  const entries = resolved
+    .flatMap((candidate) => {
+      const { entry } = candidate;
+      if (opts?.requireValidHook) {
+        if (!opts.requireValidHook(candidate)) {
+          return [];
+        }
+        if (!entry || entry.invalidMetadata || !entry.metadata?.events.length) {
+          throw new Error(
+            `Hook "${candidate.hook.name}" has missing or invalid metadata at ${candidate.filePath}`,
+          );
+        }
+        if (!entry.hook.handlerPath) {
+          throw new Error(
+            `Hook "${candidate.hook.name}" has no readable handler in ${entry.hook.baseDir}`,
+          );
+        }
+      }
+      return entry ? [entry] : [];
+    })
+    .filter((entry): entry is HookEntry => Boolean(entry.hook.handlerPath));
   return {
-    hooks: eligible.map((entry) => ({
-      name: entry.hook.name,
-      events: entry.clawdbot?.events ?? [],
+    entries,
+    sources: resolved.map(({ rootId, filePath, hook, metadata }) => ({
+      rootId,
+      filePath,
+      hook,
+      metadata,
     })),
-    resolvedHooks: eligible.map((entry) => entry.hook),
-    version: opts?.snapshotVersion,
   };
 }
 
+/** Inspect hooks best-effort without retaining an active generation's source obligations. */
 export function loadWorkspaceHookEntries(
   workspaceDir: string,
-  opts?: {
-    config?: ClawdbotConfig;
-    managedHooksDir?: string;
-    bundledHooksDir?: string;
-  },
+  opts?: HookDiscoveryOptions,
 ): HookEntry[] {
-  return loadHookEntries(workspaceDir, opts);
+  return prepareWorkspaceHookEntries(workspaceDir, opts).entries;
 }

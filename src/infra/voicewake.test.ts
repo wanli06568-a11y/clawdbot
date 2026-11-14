@@ -1,37 +1,63 @@
+// Covers voice wake trigger defaults, sanitization, and persistence.
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-
-import { describe, expect, it } from "vitest";
-
+import { afterEach, describe, expect, it } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
 import {
   defaultVoiceWakeTriggers,
   loadVoiceWakeConfig,
   setVoiceWakeTriggers,
 } from "./voicewake.js";
 
-describe("voicewake store", () => {
+const tempDirs = useAutoCleanupTempDirTracker((cleanup) => {
+  afterEach(async () => {
+    await closeStateDatabaseForTest();
+    cleanup();
+  });
+});
+
+describe("voicewake config", () => {
   it("returns defaults when missing", async () => {
-    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-voicewake-"));
-    const cfg = await loadVoiceWakeConfig(baseDir);
-    expect(cfg.triggers).toEqual(defaultVoiceWakeTriggers());
-    expect(cfg.updatedAtMs).toBe(0);
+    const baseDir = tempDirs.make("openclaw-voicewake-");
+    await expect(loadVoiceWakeConfig(baseDir)).resolves.toEqual({
+      triggers: defaultVoiceWakeTriggers(),
+    });
   });
 
   it("sanitizes and persists triggers", async () => {
-    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-voicewake-"));
+    const baseDir = tempDirs.make("openclaw-voicewake-");
     const saved = await setVoiceWakeTriggers(["  hi  ", "", "  there "], baseDir);
     expect(saved.triggers).toEqual(["hi", "there"]);
-    expect(saved.updatedAtMs).toBeGreaterThan(0);
 
-    const loaded = await loadVoiceWakeConfig(baseDir);
-    expect(loaded.triggers).toEqual(["hi", "there"]);
-    expect(loaded.updatedAtMs).toBeGreaterThan(0);
+    await expect(loadVoiceWakeConfig(baseDir)).resolves.toEqual(saved);
+    const replacement = await setVoiceWakeTriggers(["wake"], baseDir);
+    expect(replacement.triggers).toEqual(["wake"]);
+    await expect(loadVoiceWakeConfig(baseDir)).resolves.toEqual(replacement);
   });
 
-  it("falls back to defaults when triggers empty", async () => {
-    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-voicewake-"));
-    const saved = await setVoiceWakeTriggers(["", "   "], baseDir);
-    expect(saved.triggers).toEqual(defaultVoiceWakeTriggers());
+  it("does not read retired JSON trigger files at runtime", async () => {
+    const baseDir = tempDirs.make("openclaw-voicewake-");
+    await fs.mkdir(path.join(baseDir, "settings"), { recursive: true });
+    await fs.writeFile(
+      path.join(baseDir, "settings", "voicewake.json"),
+      JSON.stringify({
+        triggers: ["  wake ", "", 42, null],
+        updatedAtMs: -1,
+      }),
+      "utf8",
+    );
+
+    await expect(loadVoiceWakeConfig(baseDir)).resolves.toEqual({
+      triggers: defaultVoiceWakeTriggers(),
+    });
+  });
+
+  it("does not recreate the retired JSON trigger file", async () => {
+    const baseDir = tempDirs.make("openclaw-voicewake-");
+    await setVoiceWakeTriggers(["wake"], baseDir);
+    await expect(fs.readFile(path.join(baseDir, "settings", "voicewake.json"))).rejects.toThrow(
+      /ENOENT/u,
+    );
   });
 });

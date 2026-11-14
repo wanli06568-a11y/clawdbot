@@ -1,18 +1,20 @@
-import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
+import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 
-import { nextcloudTalkPlugin } from "./src/channel.js";
-import { setNextcloudTalkRuntime } from "./src/runtime.js";
-
-const plugin = {
+export default defineBundledChannelEntry({
   id: "nextcloud-talk",
   name: "Nextcloud Talk",
   description: "Nextcloud Talk channel plugin",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: ClawdbotPluginApi) {
-    setNextcloudTalkRuntime(api.runtime);
-    api.registerChannel({ plugin: nextcloudTalkPlugin });
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./channel-plugin-api.js",
+    exportName: "nextcloudTalkPlugin",
   },
-};
-
-export default plugin;
+  secrets: {
+    specifier: "./secret-contract-api.js",
+    exportName: "channelSecrets",
+  },
+  runtime: {
+    specifier: "./runtime-api.js",
+    exportName: "setNextcloudTalkRuntime",
+  },
+});

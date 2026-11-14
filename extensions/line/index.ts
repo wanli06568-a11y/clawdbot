@@ -1,20 +1,29 @@
-import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
+import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 
-import { linePlugin } from "./src/channel.js";
-import { registerLineCardCommand } from "./src/card-command.js";
-import { setLineRuntime } from "./src/runtime.js";
-
-const plugin = {
+export default defineBundledChannelEntry({
   id: "line",
   name: "LINE",
   description: "LINE Messaging API channel plugin",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: ClawdbotPluginApi) {
-    setLineRuntime(api.runtime);
-    api.registerChannel({ plugin: linePlugin });
-    registerLineCardCommand(api);
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./channel-plugin-api.js",
+    exportName: "linePlugin",
   },
-};
-
-export default plugin;
+  runtime: {
+    specifier: "./runtime-api.js",
+    exportName: "setLineRuntime",
+  },
+  registerFull(api) {
+    api.registerCommand({
+      name: "card",
+      description: "Send a rich card message.",
+      channels: ["line"],
+      acceptsArgs: true,
+      requireAuth: false,
+      async handler(ctx) {
+        const { handleLineCardCommand } = await import("./src/card-command.js");
+        return await handleLineCardCommand(ctx.args);
+      },
+    });
+  },
+});

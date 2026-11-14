@@ -1,123 +1,134 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-
-import { describe, expect, it } from "vitest";
-
-import type { ClawdbotPluginApi, ClawdbotPluginToolContext } from "../../../src/plugins/types.js";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import plugin from "../index.js";
 import { createLobsterTool } from "./lobster-tool.js";
 
-async function writeFakeLobsterScript(scriptBody: string, prefix = "clawdbot-lobster-plugin-") {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  const isWindows = process.platform === "win32";
+afterEach(() => vi.unstubAllEnvs());
 
-  if (isWindows) {
-    const scriptPath = path.join(dir, "lobster.js");
-    const cmdPath = path.join(dir, "lobster.cmd");
-    await fs.writeFile(scriptPath, scriptBody, { encoding: "utf8" });
-    const cmd = `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`;
-    await fs.writeFile(cmdPath, cmd, { encoding: "utf8" });
-    return { dir, binPath: cmdPath };
+const requireRecord = createRequireRecord("record", "expected-label-record");
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+function resumeToken(details: unknown, field = "requiresInput") {
+  const envelope = requireRecord(details, "Lobster envelope");
+  const request = requireRecord(envelope[field], field);
+  if (typeof request.resumeToken !== "string") {
+    throw new Error("expected a resume token");
   }
-
-  const binPath = path.join(dir, "lobster");
-  const file = `#!/usr/bin/env node\n${scriptBody}\n`;
-  await fs.writeFile(binPath, file, { encoding: "utf8", mode: 0o755 });
-  return { dir, binPath };
-}
-
-async function writeFakeLobster(params: { payload: unknown }) {
-  const scriptBody =
-    `const payload = ${JSON.stringify(params.payload)};\n` +
-    `process.stdout.write(JSON.stringify(payload));\n`;
-  return await writeFakeLobsterScript(scriptBody);
-}
-
-function fakeApi(): ClawdbotPluginApi {
-  return {
-    id: "lobster",
-    name: "lobster",
-    source: "test",
-    config: {} as any,
-    runtime: { version: "test" } as any,
-    logger: { info() {}, warn() {}, error() {}, debug() {} },
-    registerTool() {},
-    registerHttpHandler() {},
-    registerChannel() {},
-    registerGatewayMethod() {},
-    registerCli() {},
-    registerService() {},
-    registerProvider() {},
-    resolvePath: (p) => p,
-  };
-}
-
-function fakeCtx(overrides: Partial<ClawdbotPluginToolContext> = {}): ClawdbotPluginToolContext {
-  return {
-    config: {} as any,
-    workspaceDir: "/tmp",
-    agentDir: "/tmp",
-    agentId: "main",
-    sessionKey: "main",
-    messageChannel: undefined,
-    agentAccountId: undefined,
-    sandboxed: false,
-    ...overrides,
-  };
+  return request.resumeToken;
 }
 
 describe("lobster plugin tool", () => {
-  it("runs lobster and returns parsed envelope in details", async () => {
-    const fake = await writeFakeLobster({
-      payload: { ok: true, status: "ok", output: [{ hello: "world" }], requiresApproval: null },
-    });
-
-    const tool = createLobsterTool(fakeApi());
-    const res = await tool.execute("call1", {
-      action: "run",
-      pipeline: "noop",
-      lobsterPath: fake.binPath,
-      timeoutMs: 1000,
-    });
-
-    expect(res.details).toMatchObject({ ok: true, status: "ok" });
+  let tool: ReturnType<typeof createLobsterTool>;
+  let dir: string;
+  beforeEach(() => {
+    tool = createLobsterTool();
+    dir = tempDirs.make("openclaw-lobster-tool-");
+    vi.stubEnv("LOBSTER_STATE_DIR", dir);
+  });
+  const run = async (pipeline: string) =>
+    (await tool.execute("run", { action: "run", pipeline })).details;
+  const resume = async (
+    token: string,
+    decision: { responseJson?: string; approve?: boolean; cancel?: boolean },
+  ) => (await tool.execute("resume", { action: "resume", token, ...decision })).details;
+  const inputStep = (id: string, prompt: string, responseSchema: object, defaults?: object) => ({
+    id,
+    input: { prompt, responseSchema, ...(defaults ? { defaults } : {}) },
   });
 
-  it("requires absolute lobsterPath when provided", async () => {
-    const tool = createLobsterTool(fakeApi());
-    await expect(
-      tool.execute("call2", {
-        action: "run",
-        pipeline: "noop",
-        lobsterPath: "./lobster",
-      }),
-    ).rejects.toThrow(/absolute path/);
-  });
-
-  it("rejects invalid JSON from lobster", async () => {
-    const { binPath } = await writeFakeLobsterScript(
-      `process.stdout.write("nope");\n`,
-      "clawdbot-lobster-plugin-bad-",
+  it("resumes real pipeline input, preserves invalid answers, and still handles approvals", async () => {
+    const first = await run('ask --prompt "Review draft?" | approve --prompt "Publish?"');
+    expect(first).toMatchObject({
+      status: "needs_input",
+      requiresInput: { type: "input_request", prompt: "Review draft?" },
+    });
+    const token = resumeToken(first);
+    await expect(resume(token, { responseJson: '{"decision":123}' })).rejects.toThrow(
+      /schema validation/,
     );
-
-    const tool = createLobsterTool(fakeApi());
-    await expect(
-      tool.execute("call3", {
-        action: "run",
-        pipeline: "noop",
-        lobsterPath: binPath,
-      }),
-    ).rejects.toThrow(/invalid JSON/);
+    const responseJson = '{"decision":"approve","feedback":"Looks good"}';
+    const second = await resume(token, { responseJson });
+    expect(second).toMatchObject({ status: "needs_approval" });
+    const approved = await resume(resumeToken(second, "requiresApproval"), { approve: true });
+    expect(approved).toMatchObject({
+      status: "ok",
+      output: [{ decision: "approve", feedback: "Looks good" }],
+    });
+    await expect(resume(token, { responseJson: '{"decision":"reject"}' })).rejects.toThrow(
+      /not found/i,
+    );
   });
 
-  it("can be gated off in sandboxed contexts", async () => {
-    const api = fakeApi();
-    const factoryTool = (ctx: ClawdbotPluginToolContext) => {
-      if (ctx.sandboxed) return null;
-      return createLobsterTool(api);
-    };
+  it("resumes real workflow files through successive questions without repeating preparation", async () => {
+    const seed = path.join(dir, "seed.json");
+    await fs.writeFile(seed, JSON.stringify({ draft: "original" }));
+    const file = path.join(dir, "review.lobster");
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        steps: [
+          { id: "prepare", pipeline: "state.get seed | state.set prepared" },
+          inputStep("review", "Review?", { type: "object" }, { feedback: "" }),
+          inputStep("confirm", "Which label?", { type: "string" }),
+          { id: "finish", pipeline: "state.get prepared" },
+        ],
+      }),
+    );
+    const first = await run(file);
+    expect(first).toMatchObject({
+      status: "needs_input",
+      requiresInput: { defaults: { feedback: "" }, subject: { draft: "original" } },
+    });
+    await fs.writeFile(seed, JSON.stringify({ draft: "changed" }));
+    const second = await resume(resumeToken(first), { responseJson: '{"feedback":"Keep it"}' });
+    expect(second).toMatchObject({
+      status: "needs_input",
+      requiresInput: { prompt: "Which label?" },
+    });
+    // A new tool instance proves continuation comes from saved state, not the runner's memory.
+    const continued = createLobsterTool();
+    expect(continued.parameters).toBe(tool.parameters);
+    const finished = await continued.execute("finish", {
+      action: "resume",
+      token: resumeToken(second),
+      responseJson: '"reviewed"',
+    });
+    expect(finished.details).toMatchObject({ status: "ok", output: [{ draft: "original" }] });
+  });
 
-    expect(factoryTool(fakeCtx({ sandboxed: true }))).toBeNull();
-    expect(factoryTool(fakeCtx({ sandboxed: false }))?.name).toBe("lobster");
+  it("cancels a real input checkpoint without executing its remaining steps", async () => {
+    const token = resumeToken(await run("ask | state.set should-not-exist"));
+    expect(await resume(token, { cancel: true })).toMatchObject({ status: "cancelled" });
+    await expect(fs.stat(path.join(dir, "should-not-exist.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(resume(token, { responseJson: '{"decision":"approve"}' })).rejects.toThrow(
+      /not found/i,
+    );
+  });
+
+  it("registers ordinary execution without a task runtime and keeps sandbox gating", () => {
+    const registerTool = vi.fn<OpenClawPluginApi["registerTool"]>();
+    plugin.register(createTestPluginApi({ registerTool }));
+    const factory = registerTool.mock.calls[0]?.[0];
+    if (typeof factory !== "function") {
+      throw new Error("expected a registered Lobster tool factory");
+    }
+    expect(factory({ sandboxed: false })).toMatchObject({ name: "lobster" });
+    expect(factory({ sandboxed: true })).toBeNull();
+  });
+
+  it.each<[string, Record<string, unknown>, RegExp]>([
+    ["missing action", {}, /action required/],
+    ["unknown action", { action: "explode" }, /Unknown action/],
+    ["absolute cwd", { action: "run", cwd: "/tmp" }, /cwd must be a relative path/],
+    ["escaping cwd", { action: "run", pipeline: "noop", cwd: "../../etc" }, /must stay within/],
+  ])("rejects %s", async (_name, params, error) => {
+    await expect(tool.execute("invalid", params)).rejects.toThrow(error);
   });
 });

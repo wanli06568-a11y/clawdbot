@@ -1,61 +1,39 @@
 import type { Command } from "commander";
-
-import { sandboxListCommand, sandboxRecreateCommand } from "../commands/sandbox.js";
-import { sandboxExplainCommand } from "../commands/sandbox-explain.js";
+import { theme } from "../../packages/terminal-core/src/theme.js";
+import type { sandboxExplainCommand } from "../commands/sandbox-explain.js";
+import type { sandboxListCommand, sandboxRecreateCommand } from "../commands/sandbox.js";
 import { defaultRuntime } from "../runtime.js";
-import { formatDocsLink } from "../terminal/links.js";
-import { theme } from "../terminal/theme.js";
-import { formatHelpExamples } from "./help-format.js";
-
-// --- Types ---
-
-type CommandOptions = Record<string, unknown>;
-
-// --- Helpers ---
+import { runCommandWithRuntime } from "./cli-utils.js";
+import { formatDocsHelp, formatHelpExamples } from "./help-format.js";
 
 const SANDBOX_EXAMPLES = {
   main: [
-    ["clawdbot sandbox list", "List all sandbox containers."],
-    ["clawdbot sandbox list --browser", "List only browser containers."],
-    ["clawdbot sandbox recreate --all", "Recreate all containers."],
-    ["clawdbot sandbox recreate --session main", "Recreate a specific session."],
-    ["clawdbot sandbox recreate --agent mybot", "Recreate agent containers."],
-    ["clawdbot sandbox explain", "Explain effective sandbox config."],
+    ["openclaw sandbox list", "List all sandbox containers."],
+    ["openclaw sandbox list --browser", "List only browser containers."],
+    ["openclaw sandbox recreate --all", "Recreate all containers."],
+    ["openclaw sandbox recreate --session main", "Recreate a specific session."],
+    ["openclaw sandbox recreate --agent mybot", "Recreate agent containers."],
+    ["openclaw sandbox explain", "Explain effective sandbox config."],
   ],
   list: [
-    ["clawdbot sandbox list", "List all sandbox containers."],
-    ["clawdbot sandbox list --browser", "List only browser containers."],
-    ["clawdbot sandbox list --json", "JSON output."],
+    ["openclaw sandbox list", "List all sandbox containers."],
+    ["openclaw sandbox list --browser", "List only browser containers."],
+    ["openclaw sandbox list --json", "JSON output."],
   ],
   recreate: [
-    ["clawdbot sandbox recreate --all", "Recreate all containers."],
-    ["clawdbot sandbox recreate --session main", "Recreate a specific session."],
-    ["clawdbot sandbox recreate --agent mybot", "Recreate a specific agent (includes sub-agents)."],
-    ["clawdbot sandbox recreate --browser --all", "Recreate only browser containers."],
-    ["clawdbot sandbox recreate --all --force", "Skip confirmation."],
+    ["openclaw sandbox recreate --all", "Recreate all containers."],
+    ["openclaw sandbox recreate --session main", "Recreate a specific session."],
+    ["openclaw sandbox recreate --agent mybot", "Recreate a specific agent (includes sub-agents)."],
+    ["openclaw sandbox recreate --browser --all", "Recreate only browser containers."],
+    ["openclaw sandbox recreate --all --force", "Skip confirmation."],
   ],
   explain: [
-    ["clawdbot sandbox explain", "Show effective sandbox config."],
-    ["clawdbot sandbox explain --session agent:main:main", "Explain a specific session."],
-    ["clawdbot sandbox explain --agent work", "Explain an agent sandbox."],
-    ["clawdbot sandbox explain --json", "JSON output."],
+    ["openclaw sandbox explain", "Show effective sandbox config."],
+    ["openclaw sandbox explain --session agent:main:main", "Explain a specific session."],
+    ["openclaw sandbox explain --agent work", "Explain an agent sandbox."],
+    ["openclaw sandbox explain --json", "JSON output."],
   ],
 } as const;
-
-function createRunner(
-  commandFn: (opts: CommandOptions, runtime: typeof defaultRuntime) => Promise<void>,
-) {
-  return async (opts: CommandOptions) => {
-    try {
-      await commandFn(opts, defaultRuntime);
-    } catch (err) {
-      defaultRuntime.error(String(err));
-      defaultRuntime.exit(1);
-    }
-  };
-}
-
-// --- Registration ---
 
 export function registerSandboxCli(program: Command) {
   const sandbox = program
@@ -65,16 +43,10 @@ export function registerSandboxCli(program: Command) {
       "after",
       () => `\n${theme.heading("Examples:")}\n${formatHelpExamples(SANDBOX_EXAMPLES.main)}\n`,
     )
-    .addHelpText(
-      "after",
-      () =>
-        `\n${theme.muted("Docs:")} ${formatDocsLink("/cli/sandbox", "docs.clawd.bot/cli/sandbox")}\n`,
-    )
+    .addHelpText("after", () => formatDocsHelp("/cli/sandbox"))
     .action(() => {
       sandbox.help({ error: true });
     });
-
-  // --- List Command ---
 
   sandbox
     .command("list")
@@ -92,19 +64,10 @@ export function registerSandboxCli(program: Command) {
           "- Idle time (time since last use)",
         )}\n${theme.muted("- Associated session/agent ID")}`,
     )
-    .action(
-      createRunner((opts) =>
-        sandboxListCommand(
-          {
-            browser: Boolean(opts.browser),
-            json: Boolean(opts.json),
-          },
-          defaultRuntime,
-        ),
-      ),
-    );
-
-  // --- Recreate Command ---
+    .action(async (opts: Parameters<typeof sandboxListCommand>[0]) => {
+      const { sandboxListCommand } = await import("../commands/sandbox.js");
+      await runCommandWithRuntime(defaultRuntime, () => sandboxListCommand(opts, defaultRuntime));
+    });
 
   sandbox
     .command("recreate")
@@ -133,22 +96,30 @@ export function registerSandboxCli(program: Command) {
           "  --browser      Only affect browser containers (not regular sandbox)",
         )}\n${theme.muted("  --force        Skip confirmation prompt")}`,
     )
-    .action(
-      createRunner((opts) =>
-        sandboxRecreateCommand(
-          {
-            all: Boolean(opts.all),
-            session: opts.session as string | undefined,
-            agent: opts.agent as string | undefined,
-            browser: Boolean(opts.browser),
-            force: Boolean(opts.force),
-          },
-          defaultRuntime,
-        ),
-      ),
-    );
+    .action(async (opts: Parameters<typeof sandboxRecreateCommand>[0]) => {
+      const { sandboxRecreateCommand } = await import("../commands/sandbox.js");
+      await runCommandWithRuntime(defaultRuntime, () =>
+        sandboxRecreateCommand(opts, defaultRuntime),
+      );
+    });
 
-  // --- Explain Command ---
+  sandbox
+    .command("recover")
+    .description("Preserve a selected guest artifact blocking workspace size reconciliation")
+    .requiredOption("--session <key>", "Exact managed workspace session key")
+    .requiredOption("--path <relative>", "Selected retained file relative to the guest workspace")
+    .option("--recovery-id <uuid>", "Reuse the recorded ID to inspect a previous attempt")
+    .option("--json", "Output result as JSON", false)
+    .action(
+      async (
+        opts: Parameters<typeof import("../commands/sandbox-recover.js").sandboxRecoverCommand>[0],
+      ) => {
+        const { sandboxRecoverCommand } = await import("../commands/sandbox-recover.js");
+        await runCommandWithRuntime(defaultRuntime, () =>
+          sandboxRecoverCommand(opts, defaultRuntime),
+        );
+      },
+    );
 
   sandbox
     .command("explain")
@@ -160,16 +131,10 @@ export function registerSandboxCli(program: Command) {
       "after",
       () => `\n${theme.heading("Examples:")}\n${formatHelpExamples(SANDBOX_EXAMPLES.explain)}\n`,
     )
-    .action(
-      createRunner((opts) =>
-        sandboxExplainCommand(
-          {
-            session: opts.session as string | undefined,
-            agent: opts.agent as string | undefined,
-            json: Boolean(opts.json),
-          },
-          defaultRuntime,
-        ),
-      ),
-    );
+    .action(async (opts: Parameters<typeof sandboxExplainCommand>[0]) => {
+      const { sandboxExplainCommand } = await import("../commands/sandbox-explain.js");
+      await runCommandWithRuntime(defaultRuntime, () =>
+        sandboxExplainCommand(opts, defaultRuntime),
+      );
+    });
 }

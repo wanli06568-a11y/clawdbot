@@ -1,18 +1,16 @@
-import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
+import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 
-import { tlonPlugin } from "./src/channel.js";
-import { setTlonRuntime } from "./src/runtime.js";
-
-const plugin = {
+export default defineBundledChannelEntry({
   id: "tlon",
   name: "Tlon",
   description: "Tlon/Urbit channel plugin",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: ClawdbotPluginApi) {
-    setTlonRuntime(api.runtime);
-    api.registerChannel({ plugin: tlonPlugin });
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./channel-plugin-api.js",
+    exportName: "tlonPlugin",
   },
-};
-
-export default plugin;
+  runtime: {
+    specifier: "./api.js",
+    exportName: "setTlonRuntime",
+  },
+});

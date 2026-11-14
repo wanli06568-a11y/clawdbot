@@ -1,63 +1,84 @@
-import type { MatrixClient } from "@vector-im/matrix-bot-sdk";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import type { CoreConfig } from "../../types.js";
+import { resolveMatrixAccountConfig } from "../account-config.js";
+import type { MatrixRuntimeClientOptions } from "../client-bootstrap.js";
+import { getMatrixMonitorTaskSignal } from "../monitor/task-runner.js";
+import type { MatrixClient } from "../sdk.js";
+import { withMatrixSendCurrentness } from "../sdk/send-currentness.js";
 
-import { getMatrixRuntime } from "../../runtime.js";
-import { getActiveMatrixClient } from "../active-client.js";
-import {
-  createMatrixClient,
-  isBunRuntime,
-  resolveMatrixAuth,
-  resolveSharedMatrixClient,
-} from "../client.js";
-import type { CoreConfig } from "../types.js";
+type MatrixControlClientOptions = Omit<MatrixRuntimeClientOptions, "readiness">;
 
-const getCore = () => getMatrixRuntime();
+const loadMatrixSendClientRuntime = createLazyRuntimeModule(() => import("../client-bootstrap.js"));
 
-export function ensureNodeRuntime() {
-  if (isBunRuntime()) {
-    throw new Error("Matrix support requires Node (bun runtime not supported)");
-  }
+export function resolveMediaMaxBytes(
+  accountId: string | null | undefined,
+  cfg: CoreConfig,
+): number | undefined {
+  const matrixCfg = resolveMatrixAccountConfig({ cfg, accountId });
+  const mediaMaxMb = matrixCfg.mediaMaxMb;
+  // Only a positive value is a cap, matching CommonMediaMaxMbSchema. `0` or a negative
+  // number would become a literal 0-byte limit that rejects every outbound media send;
+  // fall through to the unset path instead. Inbound floors the same field (monitor/index.ts).
+  return typeof mediaMaxMb === "number" && mediaMaxMb > 0 ? mediaMaxMb * 1024 * 1024 : undefined;
 }
 
-export function resolveMediaMaxBytes(): number | undefined {
-  const cfg = getCore().config.loadConfig() as CoreConfig;
-  if (typeof cfg.channels?.matrix?.mediaMaxMb === "number") {
-    return cfg.channels.matrix.mediaMaxMb * 1024 * 1024;
-  }
-  return undefined;
+export async function withResolvedMatrixSendClient<T>(
+  opts: MatrixControlClientOptions & {
+    signal?: AbortSignal;
+    assertDirectAdapterHandoff?: () => void;
+  },
+  run: (client: MatrixClient, abortSignal?: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return await withResolvedMatrixClient(
+    {
+      ...opts,
+      // One-off outbound sends still need a started client so room encryption
+      // state and live crypto sessions are available before sendMessage/sendEvent.
+      readiness: "started",
+    },
+    (client, abortSignal) => {
+      // A pre-resolved client used to skip this guard. Retirement aborts the
+      // monitor signal while that client can still belong to another monitor.
+      const monitorSignal = getMatrixMonitorTaskSignal();
+      if (!opts.signal && !opts.assertDirectAdapterHandoff && !monitorSignal) {
+        return run(client, abortSignal);
+      }
+      return withMatrixSendCurrentness(
+        client,
+        () => {
+          opts.assertDirectAdapterHandoff?.();
+          // The SDK scheduler can drain this send in another monitor's context.
+          // Keep the signal captured at entry so retirement follows this send.
+          monitorSignal?.throwIfAborted();
+          opts.signal?.throwIfAborted();
+          abortSignal?.throwIfAborted();
+        },
+        () => run(client, abortSignal),
+      );
+    },
+  );
 }
 
-export async function resolveMatrixClient(opts: {
-  client?: MatrixClient;
-  timeoutMs?: number;
-}): Promise<{ client: MatrixClient; stopOnDone: boolean }> {
-  ensureNodeRuntime();
-  if (opts.client) return { client: opts.client, stopOnDone: false };
-  const active = getActiveMatrixClient();
-  if (active) return { client: active, stopOnDone: false };
-  const shouldShareClient = Boolean(process.env.CLAWDBOT_GATEWAY_PORT);
-  if (shouldShareClient) {
-    const client = await resolveSharedMatrixClient({
-      timeoutMs: opts.timeoutMs,
-    });
-    return { client, stopOnDone: false };
+export async function withResolvedMatrixControlClient<T>(
+  opts: MatrixControlClientOptions,
+  run: (client: MatrixClient, abortSignal?: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return await withResolvedMatrixClient(
+    {
+      ...opts,
+      readiness: "none",
+    },
+    run,
+  );
+}
+
+async function withResolvedMatrixClient<T>(
+  opts: MatrixControlClientOptions & { readiness: "started" | "none" },
+  run: (client: MatrixClient, abortSignal?: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (opts.client) {
+    return await run(opts.client);
   }
-  const auth = await resolveMatrixAuth();
-  const client = await createMatrixClient({
-    homeserver: auth.homeserver,
-    userId: auth.userId,
-    accessToken: auth.accessToken,
-    encryption: auth.encryption,
-    localTimeoutMs: opts.timeoutMs,
-  });
-  if (auth.encryption && client.crypto) {
-    try {
-      const joinedRooms = await client.getJoinedRooms();
-      await client.crypto.prepare(joinedRooms);
-    } catch {
-      // Ignore crypto prep failures for one-off sends; normal sync will retry.
-    }
-  }
-  // @vector-im/matrix-bot-sdk uses start() instead of startClient()
-  await client.start();
-  return { client, stopOnDone: true };
+  const { withResolvedRuntimeMatrixClient } = await loadMatrixSendClientRuntime();
+  return await withResolvedRuntimeMatrixClient(opts, run);
 }

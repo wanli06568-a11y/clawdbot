@@ -1,10 +1,6 @@
-export function asString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
-}
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { ChannelAccountSnapshot, ChannelStatusIssue } from "../types.public.js";
+export { isRecord } from "../../../utils.js";
 
 export function formatMatchMetadata(params: {
   matchKey?: unknown;
@@ -16,7 +12,7 @@ export function formatMatchMetadata(params: {
       : typeof params.matchKey === "number"
         ? String(params.matchKey)
         : undefined;
-  const matchSource = asString(params.matchSource);
+  const matchSource = normalizeOptionalString(params.matchSource);
   const parts = [
     matchKey ? `matchKey=${matchKey}` : null,
     matchSource ? `matchSource=${matchSource}` : null,
@@ -30,4 +26,36 @@ export function appendMatchMetadata(
 ): string {
   const meta = formatMatchMetadata(params);
   return meta ? `${message} (${meta})` : message;
+}
+
+export function resolveEnabledConfiguredAccountId(account: {
+  accountId?: unknown;
+  enabled?: unknown;
+  configured?: unknown;
+}): string | null {
+  const accountId = normalizeOptionalString(account.accountId) ?? "default";
+  const enabled = account.enabled !== false;
+  const configured = account.configured === true;
+  return enabled && configured ? accountId : null;
+}
+
+export function collectIssuesForEnabledAccounts<
+  T extends { accountId?: unknown; enabled?: unknown },
+>(params: {
+  accounts: ChannelAccountSnapshot[];
+  readAccount: (value: ChannelAccountSnapshot) => T | null;
+  collectIssues: (params: { account: T; accountId: string; issues: ChannelStatusIssue[] }) => void;
+}): ChannelStatusIssue[] {
+  const issues: ChannelStatusIssue[] = [];
+  for (const entry of params.accounts) {
+    const account = params.readAccount(entry);
+    // Disabled accounts should not produce missing credential/runtime issues in
+    // status output; they are intentionally inactive.
+    if (!account || account.enabled === false) {
+      continue;
+    }
+    const accountId = normalizeOptionalString(account.accountId) ?? "default";
+    params.collectIssues({ account, accountId, issues });
+  }
+  return issues;
 }

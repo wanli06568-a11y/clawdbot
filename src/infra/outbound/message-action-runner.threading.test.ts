@@ -1,118 +1,77 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
+import {
+  resolveAndApplyOutboundReplyToId as applyReply,
+  resolveAndApplyOutboundThreadId as applyThread,
+} from "./message-action-threading.js";
 
-import type { ClawdbotConfig } from "../../config/config.js";
-import { setActivePluginRegistry } from "../../plugins/runtime.js";
-import { createTestRegistry } from "../../test-utils/channel-plugins.js";
-import { slackPlugin } from "../../../extensions/slack/src/channel.js";
+type ReplyContext = Parameters<typeof applyReply>[1];
+const current = {
+  currentChannelId: "channel:C123",
+  currentMessageId: "msg-42",
+  replyToMode: "all",
+} as const;
+const replyContext = { channel: "workspace", toolContext: current } satisfies ReplyContext;
+const slackContext = {
+  channel: "slack",
+  toolContext: { ...current, currentChannelId: "D123", currentMessagingTarget: "user:U123" },
+} satisfies ReplyContext;
 
-const mocks = vi.hoisted(() => ({
-  executeSendAction: vi.fn(),
-  recordSessionMetaFromInbound: vi.fn(async () => ({ ok: true })),
-}));
-
-vi.mock("./outbound-send-service.js", async () => {
-  const actual = await vi.importActual<typeof import("./outbound-send-service.js")>(
-    "./outbound-send-service.js",
-  );
-  return {
-    ...actual,
-    executeSendAction: mocks.executeSendAction,
-  };
+it("skips auto-threading for an explicit null threadId", () => {
+  const resolveAutoThreadId = vi.fn(() => "42");
+  const toolContext = { currentChannelId: "forum:123", currentThreadTs: "42" };
+  const context = { cfg: {}, to: "forum:123", toolContext, resolveAutoThreadId };
+  expect(applyThread({ threadId: null }, context)).toBeUndefined();
+  expect(resolveAutoThreadId).not.toHaveBeenCalled();
 });
 
-vi.mock("../../config/sessions.js", async () => {
-  const actual = await vi.importActual<typeof import("../../config/sessions.js")>(
-    "../../config/sessions.js",
-  );
-  return {
-    ...actual,
-    recordSessionMetaFromInbound: mocks.recordSessionMetaFromInbound,
-  };
+it("inherits replies for routable target aliases", () => {
+  const params: Record<string, unknown> = { to: "user:U123" };
+  expect(applyReply(params, slackContext)).toEqual({
+    replyToId: "msg-42",
+    source: "implicit",
+    mode: "all",
+  });
+  expect(params.replyTo).toBe("msg-42");
 });
 
-import { runMessageAction } from "./message-action-runner.js";
+it.each(["top-level", "cross-provider"])("does not inherit replies for %s sends", (mode) => {
+  const params: Record<string, unknown> = {
+    target: "channel:C123",
+    topLevel: mode === "top-level",
+  };
+  const context =
+    mode === "top-level"
+      ? replyContext
+      : {
+          channel: "discord",
+          toolContext: { ...current, currentChannelProvider: "slack" },
+        };
+  expect(applyReply(params, context)).toBeUndefined();
+  expect(params.replyTo).toBeUndefined();
+});
 
-const slackConfig = {
-  channels: {
-    slack: {
-      botToken: "xoxb-test",
-      appToken: "xapp-test",
-    },
-  },
-} as ClawdbotConfig;
-
-describe("runMessageAction Slack threading", () => {
-  beforeEach(async () => {
-    const { createPluginRuntime } = await import("../../plugins/runtime/index.js");
-    const { setSlackRuntime } = await import("../../../extensions/slack/src/runtime.js");
-    const runtime = createPluginRuntime();
-    setSlackRuntime(runtime);
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "slack",
-          source: "test",
-          plugin: slackPlugin,
-        },
-      ]),
-    );
-  });
-
-  afterEach(() => {
-    setActivePluginRegistry(createTestRegistry([]));
-    mocks.executeSendAction.mockReset();
-    mocks.recordSessionMetaFromInbound.mockReset();
-  });
-
-  it("uses toolContext thread when auto-threading is active", async () => {
-    mocks.executeSendAction.mockResolvedValue({
-      handledBy: "plugin",
-      payload: {},
-    });
-
-    await runMessageAction({
-      cfg: slackConfig,
-      action: "send",
-      params: {
-        channel: "slack",
-        target: "channel:C123",
-        message: "hi",
-      },
-      toolContext: {
-        currentChannelId: "C123",
-        currentThreadTs: "111.222",
-        replyToMode: "all",
-      },
-      agentId: "main",
-    });
-
-    const call = mocks.executeSendAction.mock.calls[0]?.[0];
-    expect(call?.ctx?.mirror?.sessionKey).toBe("agent:main:slack:channel:c123:thread:111.222");
-  });
-
-  it("matches auto-threading when channel ids differ in case", async () => {
-    mocks.executeSendAction.mockResolvedValue({
-      handledBy: "plugin",
-      payload: {},
-    });
-
-    await runMessageAction({
-      cfg: slackConfig,
-      action: "send",
-      params: {
-        channel: "slack",
-        target: "channel:c123",
-        message: "hi",
-      },
-      toolContext: {
-        currentChannelId: "C123",
-        currentThreadTs: "333.444",
-        replyToMode: "all",
-      },
-      agentId: "main",
-    });
-
-    const call = mocks.executeSendAction.mock.calls[0]?.[0];
-    expect(call?.ctx?.mirror?.sessionKey).toBe("agent:main:slack:channel:c123:thread:333.444");
-  });
+it.each(["batched", "first"] as const)("consumes %s reply mode once", (mode) => {
+  const hasRepliedRef = { value: false };
+  const batched = mode === "batched";
+  const base = batched ? slackContext : replyContext;
+  const matchesToolContextTarget = vi.fn(({ target }: { target: string }) => target === "U123");
+  const context: ReplyContext = {
+    ...base,
+    toolContext: { ...base.toolContext, replyToMode: mode, hasRepliedRef },
+    ...(batched ? { matchesToolContextTarget } : {}),
+  };
+  const params: Record<string, unknown> = batched ? { target: "U123" } : { replyTo: "explicit-1" };
+  expect(applyReply(params, context)).toEqual(
+    batched
+      ? { replyToId: "msg-42", source: "implicit", mode: "first" }
+      : { replyToId: "explicit-1", source: "explicit" },
+  );
+  if (batched) {
+    expect(params.replyTo).toBe("msg-42");
+  }
+  expect(applyReply({ target: batched ? "U123" : "channel:C123" }, context)).toBeUndefined();
+  expect(hasRepliedRef.value).toBe(true);
+  if (batched) {
+    expect(matchesToolContextTarget).toHaveBeenCalledTimes(2);
+  }
 });

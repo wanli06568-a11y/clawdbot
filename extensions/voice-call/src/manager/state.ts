@@ -1,4 +1,4 @@
-import { TerminalStates, type CallRecord, type CallState, type TranscriptEntry } from "../types.js";
+import { TerminalStates, type CallRecord, type CallState } from "../types.js";
 
 const ConversationStates = new Set<CallState>(["speaking", "listening"]);
 
@@ -12,25 +12,16 @@ const StateOrder: readonly CallState[] = [
 ];
 
 export function transitionState(call: CallRecord, newState: CallState): void {
-  // No-op for same state or already terminal.
-  if (call.state === newState || TerminalStates.has(call.state)) return;
-
-  // Terminal states can always be reached from non-terminal.
-  if (TerminalStates.has(newState)) {
-    call.state = newState;
+  if (call.state === newState || TerminalStates.has(call.state)) {
     return;
   }
 
-  // Allow cycling between speaking and listening (multi-turn conversations).
-  if (ConversationStates.has(call.state) && ConversationStates.has(newState)) {
-    call.state = newState;
-    return;
-  }
-
-  // Only allow forward transitions in state order.
-  const currentIndex = StateOrder.indexOf(call.state);
-  const newIndex = StateOrder.indexOf(newState);
-  if (newIndex > currentIndex) {
+  // Calls advance monotonically except for speaking/listening conversation turns.
+  if (
+    TerminalStates.has(newState) ||
+    (ConversationStates.has(call.state) && ConversationStates.has(newState)) ||
+    StateOrder.indexOf(newState) > StateOrder.indexOf(call.state)
+  ) {
     call.state = newState;
   }
 }
@@ -39,12 +30,24 @@ export function addTranscriptEntry(
   call: CallRecord,
   speaker: "bot" | "user",
   text: string,
+  timestamp = Date.now(),
 ): void {
-  const entry: TranscriptEntry = {
-    timestamp: Date.now(),
+  call.transcript.push({
+    timestamp,
     speaker,
     text,
     isFinal: true,
+  });
+  // Caller ASR can finalize after its reply; equal timestamps retain arrival order.
+  call.transcript.sort((a, b) => a.timestamp - b.timestamp);
+}
+
+/** Stage persisted changes without exposing uncommitted state through active-call getters. */
+export function copyCallRecord(call: CallRecord): CallRecord {
+  return {
+    ...call,
+    transcript: [...call.transcript],
+    processedEventIds: [...call.processedEventIds],
+    ...(call.metadata ? { metadata: { ...call.metadata } } : {}),
   };
-  call.transcript.push(entry);
 }

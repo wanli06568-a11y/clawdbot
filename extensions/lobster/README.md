@@ -2,10 +2,27 @@
 
 Adds the `lobster` agent tool as an **optional** plugin tool.
 
+## Install
+
+```bash
+openclaw plugins install @openclaw/lobster
+```
+
+Restart the Gateway after installing or updating the plugin.
+
 ## What this is
 
-- Lobster is a standalone workflow shell (typed JSON-first pipelines + approvals/resume).
-- This plugin integrates Lobster with Clawdbot *without core changes*.
+- Lobster is a standalone workflow shell (typed JSON-first pipelines + approval/input checkpoints).
+- This plugin integrates Lobster with OpenClaw _without core changes_.
+- Input checkpoints return the question and schema; resume with `responseJson` containing the user's answer as JSON. See [structured input](https://docs.openclaw.ai/tools/lobster#structured-input).
+
+The tool's optional `cwd` is relative to the Gateway working directory. Nonblank
+values preserve leading and trailing whitespace as part of the directory name;
+blank values use the Gateway working directory.
+
+Workflow file paths also preserve their literal spelling, so `" wf.lobster"`
+does not select `wf.lobster`. The embedded runtime still requires a supported
+file extension; a space after `.lobster` is rejected rather than trimmed.
 
 ## Enable
 
@@ -16,65 +33,70 @@ Enable it in an agent allowlist:
 ```json
 {
   "agents": {
-    "list": [
-      {
-        "id": "main",
+    "entries": {
+      "main": {
+        "default": true,
         "tools": {
           "allow": [
             "lobster" // plugin id (enables all tools from this plugin)
           ]
         }
       }
-    ]
+    }
   }
 }
 ```
 
-## Using `clawd.invoke` (Lobster → Clawdbot tools)
+## Using `openclaw.invoke` (Lobster → OpenClaw tools)
 
-Some Lobster pipelines may include a `clawd.invoke` step to call back into Clawdbot tools/plugins (for example: `gog` for Google Workspace, `gh` for GitHub, `message.send`, etc.).
+Some Lobster pipelines may include a `openclaw.invoke` step to call back into OpenClaw tools/plugins (for example: `gog` for Google Workspace, `gh` for GitHub, `message.send`, etc.).
 
-For this to work, the Clawdbot Gateway must expose the tool bridge endpoint and the target tool must be allowed by policy:
+For this to work, the OpenClaw Gateway must expose the tool bridge endpoint and the target tool must be allowed by policy:
 
-- Clawdbot provides an HTTP endpoint: `POST /tools/invoke`.
+- OpenClaw provides an HTTP endpoint: `POST /tools/invoke`.
 - The request is gated by **gateway auth** (e.g. `Authorization: Bearer …` when token auth is enabled).
-- The invoked tool is gated by **tool policy** (global + per-agent + provider + group policy). If the tool is not allowed, Clawdbot returns `404 Tool not available`.
+- The invoked tool is gated by **tool policy** (global + per-agent + provider + group policy). If the tool is not allowed, OpenClaw returns `404 Tool not available`.
 
 ### Allowlisting recommended
 
-To avoid letting workflows call arbitrary tools, set a tight allowlist on the agent that will be used by `clawd.invoke`.
+To avoid letting workflows call arbitrary tools, set a tight allowlist on the agent that will be used by `openclaw.invoke`.
 
 Example (allow only a small set of tools):
 
 ```jsonc
 {
   "agents": {
-    "list": [
-      {
-        "id": "main",
+    "entries": {
+      "main": {
+        "default": true,
         "tools": {
-          "allow": [
-            "lobster",
-            "web_fetch",
-            "web_search",
-            "gog",
-            "gh"
-          ],
-          "deny": ["gateway"]
-        }
-      }
-    ]
-  }
+          "allow": ["lobster", "web_fetch", "web_search", "gog", "gh"],
+          "deny": ["gateway"],
+        },
+      },
+    },
+  },
 }
 ```
 
 Notes:
+
 - If `tools.allow` is omitted or empty, it behaves like "allow everything (except denied)". For a real allowlist, set a **non-empty** `allow`.
 - Tool names depend on which plugins you have installed/enabled.
 
 ## Security
 
-- Runs the `lobster` executable as a local subprocess.
+- Runs Lobster in process via the published `@clawdbot/lobster/core` runtime.
 - Does not manage OAuth/tokens.
 - Uses timeouts, stdout caps, and strict JSON envelope parsing.
-- Prefer an absolute `lobsterPath` in production to avoid PATH hijack.
+
+## Docs
+
+- https://docs.openclaw.ai/tools/lobster
+
+## Package
+
+- Plugin id: `lobster`
+- Tool: `lobster`
+- Package: `@openclaw/lobster`
+- Minimum OpenClaw host: `2026.4.25`

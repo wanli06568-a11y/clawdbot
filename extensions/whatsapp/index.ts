@@ -1,18 +1,32 @@
-import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
+import {
+  defineBundledChannelEntry,
+  loadBundledEntryExportSync,
+} from "openclaw/plugin-sdk/channel-entry-contract";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-entry-contract";
 
-import { whatsappPlugin } from "./src/channel.js";
-import { setWhatsAppRuntime } from "./src/runtime.js";
+function registerWhatsAppAgentTools(api: OpenClawPluginApi): void {
+  const registerTool = loadBundledEntryExportSync<(api: OpenClawPluginApi) => void>(
+    import.meta.url,
+    {
+      specifier: "./agent-tools-api.js",
+      exportName: "registerWhatsAppAgentTools",
+    },
+  );
+  registerTool(api);
+}
 
-const plugin = {
+export default defineBundledChannelEntry({
   id: "whatsapp",
   name: "WhatsApp",
   description: "WhatsApp channel plugin",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: ClawdbotPluginApi) {
-    setWhatsAppRuntime(api.runtime);
-    api.registerChannel({ plugin: whatsappPlugin });
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./channel-plugin-api.js",
+    exportName: "whatsappPlugin",
   },
-};
-
-export default plugin;
+  runtime: {
+    specifier: "./runtime-setter-api.js",
+    exportName: "setWhatsAppRuntime",
+  },
+  registerFull: registerWhatsAppAgentTools,
+});

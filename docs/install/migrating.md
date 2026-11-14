@@ -1,190 +1,165 @@
 ---
-summary: "Move (migrate) a Clawdbot install from one machine to another"
+summary: "Migration hub: cross-system imports, machine-to-machine moves, and plugin upgrades"
 read_when:
-  - You are moving Clawdbot to a new laptop/server
-  - You want to preserve sessions, auth, and channel logins (WhatsApp, etc.)
+  - You are moving OpenClaw to a new laptop or server
+  - You are coming from another agent system and want to keep state
+  - You are upgrading an in-place plugin
+title: "Migration guide"
 ---
-# Migrating Clawdbot to a new machine
 
-This guide migrates a Clawdbot Gateway from one machine to another **without redoing onboarding**.
+OpenClaw supports three migration paths: importing from another agent system, moving an existing install to a new machine, and upgrading a plugin in place.
 
-The migration is simple conceptually:
+## Import from another agent system
 
-- Copy the **state directory** (`$CLAWDBOT_STATE_DIR`, default: `~/.clawdbot/`) — this includes config, auth, sessions, and channel state.
-- Copy your **workspace** (`~/clawd/` by default) — this includes your agent files (memory, prompts, etc.).
+Bundled migration providers bring instructions, MCP servers, skills, model config, and (opt-in) API keys into OpenClaw. Plans are previewed before any change and secrets are redacted in reports. Standalone `openclaw migrate` is backed by a verified backup; fresh onboarding imports instead stage and verify local artifacts before publishing them with configuration committed before any irreversible external activation.
 
-But there are common footguns around **profiles**, **permissions**, and **partial copies**.
+<CardGroup cols={2}>
+  <Card title="Migrating from Claude" href="/install/migrating-claude" icon="brain">
+    Import Claude Code and Claude Desktop state, including `CLAUDE.md`, MCP servers, skills, and project commands.
+  </Card>
+  <Card title="Migrating from Hermes" href="/install/migrating-hermes" icon="feather">
+    Import Hermes config, providers, MCP servers, memory, skills, and supported `.env` keys.
+  </Card>
+</CardGroup>
 
-## Before you start (what you are migrating)
+The CLI entry point is [`openclaw migrate`](/cli/migrate). Onboarding can also offer migration when it detects a known source (`openclaw onboard --flow import`).
 
-### 1) Identify your state directory
+## Move OpenClaw to a new machine
 
-Most installs use the default:
+Copy the **state directory** (`~/.openclaw/` by default) and your **workspace** to preserve:
 
-- **State dir:** `~/.clawdbot/`
+- **Config** — `openclaw.json` and all gateway settings.
+- **Auth** — shared and per-agent SQLite auth stores (API keys plus OAuth), plus any channel or provider state under `credentials/`.
+- **Sessions** — conversation history and agent state.
+- **Channel state** — WhatsApp login, Telegram session, and similar.
+- **Workspace files** — `MEMORY.md`, `USER.md`, skills, and prompts.
 
-But it may be different if you use:
+<Tip>
+Run `openclaw status` on the old machine to confirm your state directory path. Custom profiles use `~/.openclaw-<profile>/` or a path set via `OPENCLAW_STATE_DIR`.
+</Tip>
 
-- `--profile <name>` (often becomes `~/.clawdbot-<profile>/`)
-- `CLAWDBOT_STATE_DIR=/some/path`
+After moving or renaming the state directory, run `openclaw gateway restart`.
+The Gateway keeps its state and install paths from startup, so a full restart is
+required; a reload is not enough. Then run `openclaw doctor` to confirm there is
+no CLI/Gateway state-directory mismatch. Use the intended profile or
+`OPENCLAW_STATE_DIR` for both commands.
 
-If you’re not sure, run on the **old** machine:
+### Migration steps
 
-```bash
-clawdbot status
-```
+<Steps>
+  <Step title="Stop the gateway and back up">
+    On the **old** machine, stop the Gateway, then create and verify a backup
+    archive:
 
-Look for mentions of `CLAWDBOT_STATE_DIR` / profile in the output. If you run multiple gateways, repeat for each profile.
+    ```bash
+    openclaw gateway stop
+    mkdir -p ~/Backups/openclaw
+    openclaw backup create --output ~/Backups/openclaw --verify
+    ```
 
-### 2) Identify your workspace
+    Stop the Gateway before taking a machine-move snapshot. A raw copy of a
+    changing SQLite database can capture mismatched database and WAL files;
+    quiescing the Gateway also keeps the rest of the state tree stable. If you
+    use multiple profiles, run the command once with each profile selected.
 
-Common defaults:
+  </Step>
 
-- `~/clawd/` (recommended workspace)
-- a custom folder you created
+  <Step title="Install OpenClaw on the new machine">
+    [Install](/install) the CLI (and Node if needed) on the new machine. It is fine if onboarding creates a fresh `~/.openclaw/` — you overwrite it next.
+  </Step>
 
-Your workspace is where files like `MEMORY.md`, `USER.md`, and `memory/*.md` live.
+  <Step title="Transfer and restore to staging">
+    Transfer the generated `.tar.gz` archive via `scp`, an external drive, or
+    another protected channel. On the new machine, restore it to a fresh
+    staging directory:
 
-### 3) Understand what you will preserve
+    ```bash
+    openclaw backup restore <archive.tar.gz> --target ~/openclaw-restored
+    ```
 
-If you copy **both** the state dir and workspace, you keep:
+    Restore never activates in place. With the Gateway stopped, use the
+    restored `manifest.json` mapping to move the state and workspace assets to
+    their recorded destinations, or point `OPENCLAW_STATE_DIR` at the restored
+    state asset. Confirm ownership matches the user that will run the Gateway.
 
-- Gateway configuration (`clawdbot.json`)
-- Auth profiles / API keys / OAuth tokens
-- Session history + agent state
-- Channel state (e.g. WhatsApp login/session)
-- Your workspace files (memory, skills notes, etc.)
+    Absolute symbolic links keep their original target locations, including
+    links to separately backed-up config or credentials. Before activating
+    state on another machine or at another path, review these links and make
+    sure their targets are correct for the new location. See the
+    [backup symbolic-link caveat](/cli/backup#what-gets-backed-up).
 
-If you copy **only** the workspace (e.g., via Git), you do **not** preserve:
+    <Warning>
+    Restoring older channel state can desynchronize ratcheting credentials such
+    as WhatsApp. Approvals and delivery/dedupe state also roll back, and plugin
+    `node_modules` trees must be reinstalled. See [Restore a full archive](/install/backups#restore-a-full-archive).
+    </Warning>
 
-- sessions
-- credentials
-- channel logins
+  </Step>
 
-Those live under `$CLAWDBOT_STATE_DIR`.
+  <Step title="Run doctor and verify">
+    On the new machine, run [Doctor](/gateway/doctor) to apply config migrations and repair services:
 
-## Migration steps (recommended)
+    ```bash
+    openclaw doctor
+    openclaw gateway restart
+    openclaw status
+    ```
 
-### Step 0 — Make a backup (old machine)
+  </Step>
+</Steps>
 
-On the **old** machine, stop the gateway first so files aren’t changing mid-copy:
-
-```bash
-clawdbot gateway stop
-```
-
-(Optional but recommended) archive the state dir and workspace:
-
-```bash
-# Adjust paths if you use a profile or custom locations
-cd ~
-tar -czf clawdbot-state.tgz .clawdbot
-
-tar -czf clawd-workspace.tgz clawd
-```
-
-If you have multiple profiles/state dirs (e.g. `~/.clawdbot-main`, `~/.clawdbot-work`), archive each.
-
-### Step 1 — Install Clawdbot on the new machine
-
-On the **new** machine, install the CLI (and Node if needed):
-
-- See: [Install](/install)
-
-At this stage, it’s OK if onboarding creates a fresh `~/.clawdbot/` — you will overwrite it in the next step.
-
-### Step 2 — Copy the state dir + workspace to the new machine
-
-Copy **both**:
-
-- `$CLAWDBOT_STATE_DIR` (default `~/.clawdbot/`)
-- your workspace (default `~/clawd/`)
-
-Common approaches:
-
-- `scp` the tarballs and extract
-- `rsync -a` over SSH
-- external drive
-
-After copying, ensure:
-
-- Hidden directories were included (e.g. `.clawdbot/`)
-- File ownership is correct for the user running the gateway
-
-### Step 3 — Run Doctor (migrations + service repair)
-
-On the **new** machine:
+If Telegram or Discord uses the default env fallback (`TELEGRAM_BOT_TOKEN` or `DISCORD_BOT_TOKEN`), verify the migrated state-dir `.env` contains those keys without printing the secret values:
 
 ```bash
-clawdbot doctor
+awk -F= '/^(TELEGRAM_BOT_TOKEN|DISCORD_BOT_TOKEN)=/ { print $1 "=present" }' ~/.openclaw/.env
 ```
 
-Doctor is the “safe boring” command. It repairs services, applies config migrations, and warns about mismatches.
+`openclaw doctor` also warns when an enabled default Telegram or Discord account has no configured token and the matching env variable is unavailable to the doctor process.
 
-Then:
+### Common pitfalls
 
-```bash
-clawdbot gateway restart
-clawdbot status
-```
+<AccordionGroup>
+  <Accordion title="Profile or state-dir mismatch">
+    If the old gateway used `--profile` or `OPENCLAW_STATE_DIR` and the new one does not, channels will appear logged out and sessions will be empty. Launch the gateway with the **same** profile or state-dir you migrated, then rerun `openclaw doctor`.
+  </Accordion>
 
-## Common footguns (and how to avoid them)
+  <Accordion title="Copying only openclaw.json">
+    The config file alone is not enough. Shared model auth lives in `state/openclaw.sqlite`, agent-local profiles live in `agents/<agentId>/agent/openclaw-agent.sqlite`, and channel and provider state lives under `credentials/`. Always migrate the **entire** state directory using the backup and restore flow above.
+  </Accordion>
 
-### Footgun: profile / state-dir mismatch
+  <Accordion title="Permissions and ownership">
+    If you copied as root or switched users, the gateway may fail to read credentials. Check that the state directory and workspace are owned by the user running the gateway.
+  </Accordion>
 
-If you ran the old gateway with a profile (or `CLAWDBOT_STATE_DIR`), and the new gateway uses a different one, you’ll see symptoms like:
+  <Accordion title="Remote mode">
+    If your UI points at a **remote** gateway, the remote host owns sessions and workspace. Migrate the gateway host itself, not your local laptop. See [FAQ](/help/faq#where-things-live-on-disk).
+  </Accordion>
 
-- config changes not taking effect
-- channels missing / logged out
-- empty session history
+  <Accordion title="Secrets in backups">
+    The state directory contains auth profiles, channel credentials, and other provider state. Store backups encrypted, avoid insecure transfer channels, and rotate keys if you suspect exposure.
+  </Accordion>
+</AccordionGroup>
 
-Fix: run the gateway/service using the **same** profile/state dir you migrated, then rerun:
-
-```bash
-clawdbot doctor
-```
-
-### Footgun: copying only `clawdbot.json`
-
-`clawdbot.json` is not enough. Many providers store state under:
-
-- `$CLAWDBOT_STATE_DIR/credentials/`
-- `$CLAWDBOT_STATE_DIR/agents/<agentId>/...`
-
-Always migrate the entire `$CLAWDBOT_STATE_DIR` folder.
-
-### Footgun: permissions / ownership
-
-If you copied as root or changed users, the gateway may fail to read credentials/sessions.
-
-Fix: ensure the state dir + workspace are owned by the user running the gateway.
-
-### Footgun: migrating between remote/local modes
-
-- If your UI (WebUI/TUI) points at a **remote** gateway, the remote host owns the session store + workspace.
-- Migrating your laptop won’t move the remote gateway’s state.
-
-If you’re in remote mode, migrate the **gateway host**.
-
-### Footgun: secrets in backups
-
-`$CLAWDBOT_STATE_DIR` contains secrets (API keys, OAuth tokens, WhatsApp creds). Treat backups like production secrets:
-
-- store encrypted
-- avoid sharing over insecure channels
-- rotate keys if you suspect exposure
-
-## Verification checklist
+### Verification checklist
 
 On the new machine, confirm:
 
-- `clawdbot status` shows the gateway running
-- Your channels are still connected (e.g. WhatsApp doesn’t require re-pair)
-- The dashboard opens and shows existing sessions
-- Your workspace files (memory, configs) are present
+- [ ] `openclaw status` shows the gateway running.
+- [ ] Channels are still connected (no re-pairing needed).
+- [ ] The dashboard opens and shows existing sessions.
+- [ ] Workspace files (memory, configs) are present.
+
+## Upgrade a plugin in place
+
+In-place plugin upgrades preserve the same plugin id and config keys but may move on-disk state into the current layout. Plugin-specific upgrade guides live alongside their channels:
+
+- [Matrix migration](/channels/matrix-migration): encrypted-state recovery limits, automatic snapshot behavior, and manual recovery commands.
 
 ## Related
 
-- [Doctor](/gateway/doctor)
-- [Gateway troubleshooting](/gateway/troubleshooting)
-- [Where does Clawdbot store its data?](/help/faq#where-does-clawdbot-store-its-data)
+- [`openclaw migrate`](/cli/migrate): CLI reference for cross-system imports.
+- [Install overview](/install): all installation methods.
+- [Doctor](/gateway/doctor): post-migration health check.
+- [Updating](/install/updating): updating an existing install in place, plus rollback strategy.
+- [Uninstall](/install/uninstall): removing OpenClaw cleanly.
+- [`openclaw backup`](/cli/backup) — create the archive this migration restores

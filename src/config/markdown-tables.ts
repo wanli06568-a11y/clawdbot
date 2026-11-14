@@ -1,6 +1,9 @@
+// Normalizes markdown table configuration by channel and rendering mode.
 import { normalizeChannelId } from "../channels/plugins/index.js";
+import { getLoadedChannelPlugin } from "../channels/plugins/registry.js";
+import { resolveChannelAccountEntry } from "../routing/account-lookup.js";
 import { normalizeAccountId } from "../routing/session-key.js";
-import type { ClawdbotConfig } from "./config.js";
+import type { ResolveMarkdownTableModeParams } from "./markdown-tables.types.js";
 import type { MarkdownTableMode } from "./types.base.js";
 
 type MarkdownConfigEntry = {
@@ -13,48 +16,45 @@ type MarkdownConfigSection = MarkdownConfigEntry & {
   accounts?: Record<string, MarkdownConfigEntry>;
 };
 
-const DEFAULT_TABLE_MODES = new Map<string, MarkdownTableMode>([
-  ["signal", "bullets"],
-  ["whatsapp", "bullets"],
-]);
-
 const isMarkdownTableMode = (value: unknown): value is MarkdownTableMode =>
-  value === "off" || value === "bullets" || value === "code";
+  value === "off" || value === "bullets" || value === "code" || value === "block";
 
 function resolveMarkdownModeFromSection(
   section: MarkdownConfigSection | undefined,
+  channel: string,
   accountId?: string | null,
 ): MarkdownTableMode | undefined {
-  if (!section) return undefined;
+  if (!section) {
+    return undefined;
+  }
   const normalizedAccountId = normalizeAccountId(accountId);
   const accounts = section.accounts;
   if (accounts && typeof accounts === "object") {
-    const direct = accounts[normalizedAccountId];
-    const directMode = direct?.markdown?.tables;
-    if (isMarkdownTableMode(directMode)) return directMode;
-    const matchKey = Object.keys(accounts).find(
-      (key) => key.toLowerCase() === normalizedAccountId.toLowerCase(),
-    );
-    const match = matchKey ? accounts[matchKey] : undefined;
+    const match = resolveChannelAccountEntry(accounts, normalizedAccountId, channel);
     const matchMode = match?.markdown?.tables;
-    if (isMarkdownTableMode(matchMode)) return matchMode;
+    if (isMarkdownTableMode(matchMode)) {
+      return matchMode;
+    }
   }
   const sectionMode = section.markdown?.tables;
   return isMarkdownTableMode(sectionMode) ? sectionMode : undefined;
 }
 
-export function resolveMarkdownTableMode(params: {
-  cfg?: Partial<ClawdbotConfig>;
-  channel?: string | null;
-  accountId?: string | null;
-}): MarkdownTableMode {
-  const channel = normalizeChannelId(params.channel);
-  const defaultMode = channel ? (DEFAULT_TABLE_MODES.get(channel) ?? "code") : "code";
-  if (!channel || !params.cfg) return defaultMode;
-  const channelsConfig = params.cfg.channels as Record<string, unknown> | undefined;
-  const section = (channelsConfig?.[channel] ??
-    (params.cfg as Record<string, unknown> | undefined)?.[channel]) as
-    | MarkdownConfigSection
-    | undefined;
-  return resolveMarkdownModeFromSection(section, params.accountId) ?? defaultMode;
+export function resolveMarkdownTableMode(
+  params: ResolveMarkdownTableModeParams,
+): MarkdownTableMode {
+  const channel = normalizeChannelId(params.channel) ?? params.channel?.trim().toLowerCase();
+  const defaultMode = channel
+    ? (getLoadedChannelPlugin(channel)?.messaging?.defaultMarkdownTableMode ?? "code")
+    : "code";
+  let resolved = defaultMode;
+  if (channel && params.cfg) {
+    const channelsConfig = params.cfg.channels as Record<string, unknown> | undefined;
+    const rootConfig = params.cfg as Record<string, unknown>;
+    const section = (channelsConfig?.[channel] ?? rootConfig[channel]) as
+      | MarkdownConfigSection
+      | undefined;
+    resolved = resolveMarkdownModeFromSection(section, channel, params.accountId) ?? defaultMode;
+  }
+  return resolved === "block" && !params.supportsBlockTables ? "code" : resolved;
 }

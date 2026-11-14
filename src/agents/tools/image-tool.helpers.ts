@@ -1,85 +1,107 @@
-import type { AssistantMessage } from "@mariozechner/pi-ai";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { isMinimaxVlmProvider } from "../minimax-vlm.js";
+import { findNormalizedProviderValue, normalizeProviderId } from "../model-selection.js";
+import { coerceToolModelConfig, type ToolModelConfig } from "./model-config.helpers.js";
 
-import type { ClawdbotConfig } from "../../config/config.js";
-import { extractAssistantText } from "../pi-embedded-utils.js";
+export type ImageModelConfig = ToolModelConfig;
 
-export type ImageModelConfig = { primary?: string; fallbacks?: string[] };
-
-export function decodeDataUrl(dataUrl: string): {
-  buffer: Buffer;
-  mimeType: string;
-  kind: "image";
-} {
-  const trimmed = dataUrl.trim();
-  const match = /^data:([^;,]+);base64,([a-z0-9+/=\r\n]+)$/i.exec(trimmed);
-  if (!match) throw new Error("Invalid data URL (expected base64 data: URL).");
-  const mimeType = (match[1] ?? "").trim().toLowerCase();
-  if (!mimeType.startsWith("image/")) {
-    throw new Error(`Unsupported data URL type: ${mimeType || "unknown"}`);
-  }
-  const b64 = (match[2] ?? "").trim();
-  const buffer = Buffer.from(b64, "base64");
-  if (buffer.length === 0) {
-    throw new Error("Invalid data URL: empty payload.");
-  }
-  return { buffer, mimeType, kind: "image" };
+export function coerceImageModelConfig(cfg?: OpenClawConfig): ImageModelConfig {
+  return coerceToolModelConfig(cfg?.agents?.defaults?.imageModel);
 }
 
-export function coerceImageAssistantText(params: {
-  message: AssistantMessage;
-  provider: string;
-  model: string;
+function resolveProviderlessConfiguredImageModelRef(params: {
+  cfg?: OpenClawConfig;
+  ref: string;
 }): string {
-  const stop = params.message.stopReason;
-  const errorMessage = params.message.errorMessage?.trim();
-  if (stop === "error" || stop === "aborted") {
-    throw new Error(
-      errorMessage
-        ? `Image model failed (${params.provider}/${params.model}): ${errorMessage}`
-        : `Image model failed (${params.provider}/${params.model})`,
-    );
+  const ref = params.ref.trim();
+  if (!ref || ref.includes("/")) {
+    return ref;
   }
-  if (errorMessage) {
-    throw new Error(`Image model failed (${params.provider}/${params.model}): ${errorMessage}`);
+
+  const providers = params.cfg?.models?.providers;
+  const matchedRefs = new Set<string>();
+  for (const [providerKey, providerConfig] of Object.entries(providers ?? {})) {
+    const provider = normalizeProviderId(providerKey);
+    if (!provider || !Array.isArray(providerConfig?.models)) {
+      continue;
+    }
+    for (const entry of providerConfig.models) {
+      const modelId = entry?.id?.trim();
+      if (!modelId || !Array.isArray(entry?.input) || !entry.input.includes("image")) {
+        continue;
+      }
+      const candidates = [modelId];
+      const slash = modelId.indexOf("/");
+      if (slash > 0 && normalizeProviderId(modelId.slice(0, slash)) === provider) {
+        candidates.push(modelId.slice(slash + 1));
+      }
+      const normalizedRef = normalizeLowercaseStringOrEmpty(ref);
+      if (
+        !candidates.some(
+          (candidate) => normalizeLowercaseStringOrEmpty(candidate) === normalizedRef,
+        )
+      ) {
+        continue;
+      }
+      matchedRefs.add(
+        slash > 0 && normalizeProviderId(modelId.slice(0, slash)) === provider
+          ? modelId
+          : `${provider}/${modelId}`,
+      );
+    }
   }
-  const text = extractAssistantText(params.message);
-  if (text.trim()) return text.trim();
-  throw new Error(`Image model returned no text (${params.provider}/${params.model}).`);
+  const matches = [...matchedRefs];
+  if (matches.length <= 1) {
+    return matches.at(0) ?? ref;
+  }
+  throw new Error(
+    `Ambiguous image model "${ref}". Configure a provider-prefixed ref such as ${matches
+      .map((match) => `"${match}"`)
+      .join(" or ")}.`,
+  );
 }
 
-export function coerceImageModelConfig(cfg?: ClawdbotConfig): ImageModelConfig {
-  const imageModel = cfg?.agents?.defaults?.imageModel as
-    | { primary?: string; fallbacks?: string[] }
-    | string
-    | undefined;
-  const primary = typeof imageModel === "string" ? imageModel.trim() : imageModel?.primary;
-  const fallbacks = typeof imageModel === "object" ? (imageModel?.fallbacks ?? []) : [];
+export function resolveConfiguredImageModelRefs(params: {
+  cfg?: OpenClawConfig;
+  imageModelConfig: ImageModelConfig;
+}): ImageModelConfig {
+  const primary = params.imageModelConfig.primary?.trim();
+  const fallbacks = params.imageModelConfig.fallbacks
+    ?.map((ref) => resolveProviderlessConfiguredImageModelRef({ cfg: params.cfg, ref }))
+    .filter((ref) => ref.length > 0);
+
   return {
-    ...(primary?.trim() ? { primary: primary.trim() } : {}),
-    ...(fallbacks.length > 0 ? { fallbacks } : {}),
+    ...(params.imageModelConfig.primary !== undefined
+      ? {
+          primary: primary
+            ? resolveProviderlessConfiguredImageModelRef({ cfg: params.cfg, ref: primary })
+            : primary,
+        }
+      : {}),
+    ...(fallbacks && fallbacks.length > 0 ? { fallbacks } : {}),
+    ...(params.imageModelConfig.timeoutMs !== undefined
+      ? { timeoutMs: params.imageModelConfig.timeoutMs }
+      : {}),
   };
 }
 
 export function resolveProviderVisionModelFromConfig(params: {
-  cfg?: ClawdbotConfig;
+  cfg?: OpenClawConfig;
   provider: string;
 }): string | null {
-  const providerCfg = params.cfg?.models?.providers?.[params.provider] as unknown as
-    | { models?: Array<{ id?: string; input?: string[] }> }
-    | undefined;
+  if (isMinimaxVlmProvider(params.provider)) {
+    return null;
+  }
+  const providerCfg = findNormalizedProviderValue(params.cfg?.models?.providers, params.provider);
   const models = providerCfg?.models ?? [];
-  const preferMinimaxVl =
-    params.provider === "minimax"
-      ? models.find(
-          (m) =>
-            (m?.id ?? "").trim() === "MiniMax-VL-01" &&
-            Array.isArray(m?.input) &&
-            m.input.includes("image"),
-        )
-      : null;
-  const picked =
-    preferMinimaxVl ??
-    models.find((m) => Boolean((m?.id ?? "").trim()) && m.input?.includes("image"));
+  const picked = models.find((m) => Boolean((m?.id ?? "").trim()) && m.input?.includes("image"));
   const id = (picked?.id ?? "").trim();
-  return id ? `${params.provider}/${id}` : null;
+  if (!id) {
+    return null;
+  }
+  const slash = id.indexOf("/");
+  const idProvider = slash === -1 ? "" : normalizeLowercaseStringOrEmpty(id.slice(0, slash));
+  const selectedProvider = normalizeLowercaseStringOrEmpty(params.provider);
+  return idProvider && idProvider === selectedProvider ? id : `${params.provider}/${id}`;
 }

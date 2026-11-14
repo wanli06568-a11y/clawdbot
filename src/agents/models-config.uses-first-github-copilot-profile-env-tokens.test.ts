@@ -1,157 +1,95 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { withTempHome as withTempHomeBase } from "../../test/helpers/temp-home.js";
-import type { ClawdbotConfig } from "../config/config.js";
+import { expect, it, vi } from "vitest";
+import { planModelsJsonForTest } from "./models-config.plan.test-support.js";
+import type { resolveImplicitProviders } from "./models-config.providers.implicit.js";
+import { createProviderAuthResolver } from "./models-config.providers.secrets.js";
 
-async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
-  return withTempHomeBase(fn, { prefix: "clawdbot-models-" });
-}
+vi.mock("./model-auth-env.js", () => ({
+  resolveEnvApiKey: () => null,
+}));
 
-const _MODELS_CONFIG: ClawdbotConfig = {
-  models: {
-    providers: {
-      "custom-proxy": {
-        baseUrl: "http://localhost:4000/v1",
-        apiKey: "TEST_KEY",
-        api: "openai-completions",
-        models: [
-          {
-            id: "llama-3.1-8b",
-            name: "Llama 3.1 8B (Proxy)",
-            api: "openai-completions",
-            reasoning: false,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 128000,
-            maxTokens: 32000,
-          },
-        ],
+vi.mock("./provider-auth-aliases.js", () => ({
+  resolveProviderAuthAliasMap: () => ({}),
+  resolveProviderIdForAuth: (provider: string) => provider.trim().toLowerCase(),
+}));
+
+vi.mock("./model-auth-env-vars.js", () => ({
+  listKnownProviderEnvApiKeyNames: () => [],
+  resolveProviderEnvAuthLookupMaps: () => ({
+    aliasMap: {},
+    envCandidateMap: {},
+    authEvidenceMap: {},
+  }),
+}));
+
+vi.mock("../plugins/provider-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/provider-runtime.js")>()),
+  resolveProviderSyntheticAuthWithPlugin: () => undefined,
+}));
+
+vi.mock("./models-config.providers.catalog.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./models-config.providers.catalog.js")>()),
+  materializeConfiguredProviderCatalogModels: (providers: unknown) => providers,
+  normalizeProviderCatalogModelsForConfig: (providers: unknown) => providers,
+}));
+
+vi.mock("./models-config.providers.source-managed.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./models-config.providers.source-managed.js")>()),
+  enforceSourceManagedProviderSecrets: ({ providers }: { providers: unknown }) => providers,
+}));
+
+vi.mock("./models-config.providers.implicit.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./models-config.providers.implicit.js")>()),
+  resolveImplicitProviders: async ({
+    explicitProviders,
+  }: Parameters<typeof resolveImplicitProviders>[0]) => explicitProviders ?? {},
+}));
+
+const tokenCredential = { type: "token" as const, provider: "github-copilot" };
+const expectedAuth = (profile: string, apiKey: string, discoveryApiKey = apiKey) => ({
+  apiKey,
+  discoveryApiKey,
+  mode: "token",
+  source: "profile",
+  profileId: `github-copilot:${profile}`,
+});
+
+it.each([
+  [
+    "uses the first github-copilot profile when env tokens are missing",
+    {},
+    {
+      "github-copilot:alpha": { ...tokenCredential, token: "alpha-token" },
+      "github-copilot:beta": { ...tokenCredential, token: "beta-token" },
+    },
+    expectedAuth("alpha", "alpha-token"),
+  ],
+  [
+    "uses tokenRef env var when github-copilot profile omits plaintext token",
+    { COPILOT_REF_TOKEN: "token-from-ref-env" },
+    {
+      "github-copilot:default": {
+        ...tokenCredential,
+        tokenRef: { source: "env" as const, provider: "default", id: "COPILOT_REF_TOKEN" },
       },
     },
-  },
-};
+    expectedAuth("default", "COPILOT_REF_TOKEN", "token-from-ref-env"),
+  ],
+] as const)("%s", (_name, env, profiles, expected) => {
+  const auth = createProviderAuthResolver(env, { version: 1, profiles });
+  expect(auth("github-copilot")).toEqual(expected);
+});
 
-describe("models-config", () => {
-  let previousHome: string | undefined;
-
-  beforeEach(() => {
-    previousHome = process.env.HOME;
+it("keeps a non-empty existing models.json baseUrl when merge mode regenerates the provider", async () => {
+  const baseUrl = "https://api.kilo.ai/api/gateway";
+  const provider = { baseUrl: `${baseUrl}/v1`, api: "openai-completions" as const, models: [] };
+  const existing = { providers: { kilocode: { ...provider, baseUrl } } };
+  const plan = await planModelsJsonForTest({
+    cfg: { models: { providers: { kilocode: provider } } },
+    agentDir: "/tmp/openclaw-agent",
+    env: {},
+    existingRaw: `${JSON.stringify(existing, null, 2)}\n`,
+    existingParsed: existing,
   });
 
-  afterEach(() => {
-    process.env.HOME = previousHome;
-  });
-
-  it("uses the first github-copilot profile when env tokens are missing", async () => {
-    await withTempHome(async (home) => {
-      const previous = process.env.COPILOT_GITHUB_TOKEN;
-      const previousGh = process.env.GH_TOKEN;
-      const previousGithub = process.env.GITHUB_TOKEN;
-      delete process.env.COPILOT_GITHUB_TOKEN;
-      delete process.env.GH_TOKEN;
-      delete process.env.GITHUB_TOKEN;
-
-      try {
-        vi.resetModules();
-
-        const agentDir = path.join(home, "agent-profiles");
-        await fs.mkdir(agentDir, { recursive: true });
-        await fs.writeFile(
-          path.join(agentDir, "auth-profiles.json"),
-          JSON.stringify(
-            {
-              version: 1,
-              profiles: {
-                "github-copilot:alpha": {
-                  type: "token",
-                  provider: "github-copilot",
-                  token: "alpha-token",
-                },
-                "github-copilot:beta": {
-                  type: "token",
-                  provider: "github-copilot",
-                  token: "beta-token",
-                },
-              },
-            },
-            null,
-            2,
-          ),
-        );
-
-        const resolveCopilotApiToken = vi.fn().mockResolvedValue({
-          token: "copilot",
-          expiresAt: Date.now() + 60 * 60 * 1000,
-          source: "mock",
-          baseUrl: "https://api.copilot.example",
-        });
-
-        vi.doMock("../providers/github-copilot-token.js", () => ({
-          DEFAULT_COPILOT_API_BASE_URL: "https://api.individual.githubcopilot.com",
-          resolveCopilotApiToken,
-        }));
-
-        const { ensureClawdbotModelsJson } = await import("./models-config.js");
-
-        await ensureClawdbotModelsJson({ models: { providers: {} } }, agentDir);
-
-        expect(resolveCopilotApiToken).toHaveBeenCalledWith(
-          expect.objectContaining({ githubToken: "alpha-token" }),
-        );
-      } finally {
-        if (previous === undefined) delete process.env.COPILOT_GITHUB_TOKEN;
-        else process.env.COPILOT_GITHUB_TOKEN = previous;
-        if (previousGh === undefined) delete process.env.GH_TOKEN;
-        else process.env.GH_TOKEN = previousGh;
-        if (previousGithub === undefined) delete process.env.GITHUB_TOKEN;
-        else process.env.GITHUB_TOKEN = previousGithub;
-      }
-    });
-  });
-  it("does not override explicit github-copilot provider config", async () => {
-    await withTempHome(async () => {
-      const previous = process.env.COPILOT_GITHUB_TOKEN;
-      process.env.COPILOT_GITHUB_TOKEN = "gh-token";
-
-      try {
-        vi.resetModules();
-
-        vi.doMock("../providers/github-copilot-token.js", () => ({
-          DEFAULT_COPILOT_API_BASE_URL: "https://api.individual.githubcopilot.com",
-          resolveCopilotApiToken: vi.fn().mockResolvedValue({
-            token: "copilot",
-            expiresAt: Date.now() + 60 * 60 * 1000,
-            source: "mock",
-            baseUrl: "https://api.copilot.example",
-          }),
-        }));
-
-        const { ensureClawdbotModelsJson } = await import("./models-config.js");
-        const { resolveClawdbotAgentDir } = await import("./agent-paths.js");
-
-        await ensureClawdbotModelsJson({
-          models: {
-            providers: {
-              "github-copilot": {
-                baseUrl: "https://copilot.local",
-                api: "openai-responses",
-                models: [],
-              },
-            },
-          },
-        });
-
-        const agentDir = resolveClawdbotAgentDir();
-        const raw = await fs.readFile(path.join(agentDir, "models.json"), "utf8");
-        const parsed = JSON.parse(raw) as {
-          providers: Record<string, { baseUrl?: string }>;
-        };
-
-        expect(parsed.providers["github-copilot"]?.baseUrl).toBe("https://copilot.local");
-      } finally {
-        process.env.COPILOT_GITHUB_TOKEN = previous;
-      }
-    });
-  });
+  expect(plan).toEqual({ action: "noop", pluginCatalogWrites: {} });
 });

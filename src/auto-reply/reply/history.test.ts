@@ -1,152 +1,76 @@
 import { describe, expect, it } from "vitest";
-import {
-  appendHistoryEntry,
-  buildHistoryContext,
-  buildHistoryContextFromEntries,
-  buildHistoryContextFromMap,
-  buildPendingHistoryContextFromMap,
-  clearHistoryEntriesIfEnabled,
-  HISTORY_CONTEXT_MARKER,
-  recordPendingHistoryEntryIfEnabled,
-} from "./history.js";
-import { CURRENT_MESSAGE_MARKER } from "./mentions.js";
+import { createDeferred } from "../../../test/helpers/promise.js";
+import { normalizeHistoryMediaEntries, recordPendingHistoryEntryWithMedia } from "./history.js";
+import type { HistoryEntry } from "./history.types.js";
 
-describe("history helpers", () => {
-  it("returns current message when history is empty", () => {
-    const result = buildHistoryContext({
-      historyText: "  ",
-      currentMessage: "hello",
-    });
-    expect(result).toBe("hello");
+const entry = { sender: "Alice", body: "<media:image>", messageId: "msg-1" };
+function record(media: Parameters<typeof recordPendingHistoryEntryWithMedia>[0]["media"]) {
+  const historyMap = new Map<string, HistoryEntry[]>();
+  const pending = recordPendingHistoryEntryWithMedia({
+    historyMap,
+    historyKey: "channel-1",
+    limit: 5,
+    entry: { ...entry },
+    media,
   });
+  return { historyMap, pending };
+}
 
-  it("wraps history entries and excludes current by default", () => {
-    const result = buildHistoryContextFromEntries({
-      entries: [
-        { sender: "A", body: "one" },
-        { sender: "B", body: "two" },
-      ],
-      currentMessage: "current",
-      formatEntry: (entry) => `${entry.sender}: ${entry.body}`,
-    });
-
-    expect(result).toContain(HISTORY_CONTEXT_MARKER);
-    expect(result).toContain("A: one");
-    expect(result).not.toContain("B: two");
-    expect(result).toContain(CURRENT_MESSAGE_MARKER);
-    expect(result).toContain("current");
-  });
-
-  it("trims history to configured limit", () => {
-    const historyMap = new Map<string, { sender: string; body: string }[]>();
-
-    appendHistoryEntry({
-      historyMap,
-      historyKey: "group",
-      limit: 2,
-      entry: { sender: "A", body: "one" },
-    });
-    appendHistoryEntry({
-      historyMap,
-      historyKey: "group",
-      limit: 2,
-      entry: { sender: "B", body: "two" },
-    });
-    appendHistoryEntry({
-      historyMap,
-      historyKey: "group",
-      limit: 2,
-      entry: { sender: "C", body: "three" },
-    });
-
-    expect(historyMap.get("group")?.map((entry) => entry.body)).toEqual(["two", "three"]);
-  });
-
-  it("builds context from map and appends entry", () => {
-    const historyMap = new Map<string, { sender: string; body: string }[]>();
-    historyMap.set("group", [
-      { sender: "A", body: "one" },
-      { sender: "B", body: "two" },
+describe("history media recording", () => {
+  it("keeps only bounded local image media", () => {
+    expect(
+      normalizeHistoryMediaEntries({
+        limit: 2,
+        messageId: "msg-1",
+        media: [
+          { path: "/tmp/a.png", contentType: "image/png" },
+          { path: "https://example.com/b.png", contentType: "image/png" },
+          { path: "/tmp/c.pdf", contentType: "application/pdf", kind: "document" },
+          { path: "C:\\tmp\\d.jpg", kind: "image" },
+          { path: "/tmp/e.jpg", kind: "image" },
+        ],
+      }),
+    ).toEqual([
+      { path: "/tmp/a.png", contentType: "image/png", kind: "image", messageId: "msg-1" },
+      { path: "C:\\tmp\\d.jpg", kind: "image", messageId: "msg-1" },
     ]);
-
-    const result = buildHistoryContextFromMap({
-      historyMap,
-      historyKey: "group",
-      limit: 3,
-      entry: { sender: "C", body: "three" },
-      currentMessage: "current",
-      formatEntry: (entry) => `${entry.sender}: ${entry.body}`,
-    });
-
-    expect(historyMap.get("group")?.map((entry) => entry.body)).toEqual(["one", "two", "three"]);
-    expect(result).toContain(HISTORY_CONTEXT_MARKER);
-    expect(result).toContain("A: one");
-    expect(result).toContain("B: two");
-    expect(result).not.toContain("C: three");
   });
 
-  it("builds context from pending map without appending", () => {
-    const historyMap = new Map<string, { sender: string; body: string }[]>();
-    historyMap.set("group", [
-      { sender: "A", body: "one" },
-      { sender: "B", body: "two" },
+  it("records an extensionless sticker without transport MIME at the channel history boundary", async () => {
+    const sticker = { path: "/tmp/telegram-sticker", kind: "sticker" as const };
+    const expectedSticker = { ...sticker, contentType: undefined, messageId: "msg-1" };
+    const { historyMap, pending } = record(async () => [sticker]);
+    await pending;
+    expect(historyMap.get("channel-1")).toEqual([
+      {
+        ...entry,
+        media: [expectedSticker],
+      },
     ]);
-
-    const result = buildPendingHistoryContextFromMap({
-      historyMap,
-      historyKey: "group",
-      limit: 3,
-      currentMessage: "current",
-      formatEntry: (entry) => `${entry.sender}: ${entry.body}`,
-    });
-
-    expect(historyMap.get("group")?.map((entry) => entry.body)).toEqual(["one", "two"]);
-    expect(result).toContain(HISTORY_CONTEXT_MARKER);
-    expect(result).toContain("A: one");
-    expect(result).toContain("B: two");
-    expect(result).toContain(CURRENT_MESSAGE_MARKER);
-    expect(result).toContain("current");
   });
 
-  it("records pending entries only when enabled", () => {
-    const historyMap = new Map<string, { sender: string; body: string }[]>();
-
-    recordPendingHistoryEntryIfEnabled({
-      historyMap,
-      historyKey: "group",
-      limit: 0,
-      entry: { sender: "A", body: "one" },
-    });
-    expect(historyMap.get("group")).toEqual(undefined);
-
-    recordPendingHistoryEntryIfEnabled({
-      historyMap,
-      historyKey: "group",
-      limit: 2,
-      entry: null,
-    });
-    expect(historyMap.get("group")).toEqual(undefined);
-
-    recordPendingHistoryEntryIfEnabled({
-      historyMap,
-      historyKey: "group",
-      limit: 2,
-      entry: { sender: "B", body: "two" },
-    });
-    expect(historyMap.get("group")?.map((entry) => entry.body)).toEqual(["two"]);
-  });
-
-  it("clears history entries only when enabled", () => {
-    const historyMap = new Map<string, { sender: string; body: string }[]>();
-    historyMap.set("group", [
-      { sender: "A", body: "one" },
-      { sender: "B", body: "two" },
+  it("preserves explicitly identified SVG history media", () => {
+    const media = { path: "/tmp/diagram.svg", contentType: "image/svg+xml" };
+    expect(normalizeHistoryMediaEntries({ media: [media] })).toEqual([
+      { ...media, kind: "image", messageId: undefined },
     ]);
+  });
 
-    clearHistoryEntriesIfEnabled({ historyMap, historyKey: "group", limit: 0 });
-    expect(historyMap.get("group")?.map((entry) => entry.body)).toEqual(["one", "two"]);
+  it("records text history before async media resolution finishes", async () => {
+    const media = createDeferred<HistoryEntry["media"]>();
+    const { historyMap, pending } = record(async () => await media.promise);
+    expect(historyMap.get("channel-1")).toEqual([entry]);
 
-    clearHistoryEntriesIfEnabled({ historyMap, historyKey: "group", limit: 2 });
-    expect(historyMap.get("group")).toEqual([]);
+    media.resolve([{ path: "/tmp/a.png", contentType: "image/png" }]);
+    await pending;
+
+    expect(historyMap.get("channel-1")).toEqual([
+      {
+        ...entry,
+        media: [
+          { path: "/tmp/a.png", contentType: "image/png", kind: "image", messageId: "msg-1" },
+        ],
+      },
+    ]);
   });
 });

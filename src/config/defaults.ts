@@ -1,28 +1,54 @@
-import { DEFAULT_CONTEXT_TOKENS } from "../agents/defaults.js";
-import { parseModelRef } from "../agents/model-selection.js";
-import { resolveTalkApiKey } from "./talk.js";
-import type { ClawdbotConfig } from "./types.js";
-import { DEFAULT_AGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_CONCURRENT } from "./agent-limits.js";
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
+import {
+  collectManifestModelIdNormalizationPolicies,
+  normalizeConfiguredProviderCatalogModelId,
+} from "@openclaw/model-catalog-core/provider-model-id-normalization";
+import {
+  asFiniteNumber,
+  asPositiveFiniteNumber,
+} from "@openclaw/normalization-core/number-coercion";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { DEFAULT_CONTEXT_TOKENS, resolveDefaultModelMaxTokens } from "../agents/defaults.js";
+import { resolveCatalogOwnedModelCompat } from "../agents/model-compat-catalog.js";
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
+import {
+  DEFAULT_SUBAGENT_ARCHIVE_AFTER_MINUTES,
+  DEFAULT_SUBAGENT_MAX_CONCURRENT,
+  resolveAgentMaxConcurrent,
+} from "./agent-limits.js";
+import { mergeModelCost } from "./model-cost.js";
+import {
+  normalizeAgentModelMapForConfig,
+  normalizeAgentModelSelectionForConfig,
+} from "./model-input.js";
+import { materializeConfiguredProviderModelRows } from "./model-provider-rows.js";
+import {
+  applyProviderConfigDefaultsForConfig,
+  normalizeProviderConfigForConfigDefaults,
+} from "./provider-policy.js";
 import type { ModelDefinitionConfig } from "./types.models.js";
+import type { OpenClawConfig } from "./types.openclaw.js";
 
-type WarnState = { warned: boolean };
+type ProviderPolicyDefaultsOptions = {
+  env?: NodeJS.ProcessEnv;
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
+  loadManifestRegistry?: () => Pick<PluginManifestRegistry, "plugins"> | undefined;
+};
 
-let defaultWarnState: WarnState = { warned: false };
+let warnedAboutMainKey = false;
 
-type AnthropicAuthDefaultsMode = "api_key" | "oauth";
+export const DEFAULT_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  opus: "anthropic/claude-opus-5-5",
+  sonnet: "anthropic/claude-sonnet-5-5",
 
-const DEFAULT_MODEL_ALIASES: Readonly<Record<string, string>> = {
-  // Anthropic (pi-ai catalog uses "latest" ids without date suffix)
-  opus: "anthropic/claude-opus-4-5",
-  sonnet: "anthropic/claude-sonnet-4-5",
+  gpt: "openai/gpt-5.4",
+  "gpt-mini": "openai/gpt-5.4-mini",
+  "gpt-nano": "openai/gpt-5.4-nano",
 
-  // OpenAI
-  gpt: "openai/gpt-5.2",
-  "gpt-mini": "openai/gpt-5-mini",
-
-  // Google Gemini (3.x are preview ids in the catalog)
-  gemini: "google/gemini-3-pro-preview",
-  "gemini-flash": "google/gemini-3-flash-preview",
+  gemini: "google/gemini-4-argon",
+  "gemini-flash": "google/gemini-3.8-flash",
+  "gemini-flash-lite": "google/gemini-3.5-flash-lite",
 };
 
 const DEFAULT_MODEL_COST: ModelDefinitionConfig["cost"] = {
@@ -32,14 +58,19 @@ const DEFAULT_MODEL_COST: ModelDefinitionConfig["cost"] = {
   cacheWrite: 0,
 };
 const DEFAULT_MODEL_INPUT: ModelDefinitionConfig["input"] = ["text"];
-const DEFAULT_MODEL_MAX_TOKENS = 8192;
+// Mistral rejects output caps that fill the context window; keep its repair value conservative.
+const MISTRAL_UNKNOWN_MODEL_SAFE_MAX_TOKENS = 8_192;
+const MISTRAL_SAFE_MAX_TOKENS_BY_MODEL = {
+  "devstral-medium-latest": 32_768,
+  "magistral-small": 40_000,
+  "mistral-large-latest": 16_384,
+  "mistral-medium-2508": 8_192,
+  "mistral-small-latest": 16_384,
+  "pixtral-large-latest": 32_768,
+} as const;
 
 type ModelDefinitionLike = Partial<ModelDefinitionConfig> &
   Pick<ModelDefinitionConfig, "id" | "name">;
-
-function isPositiveNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0;
-}
 
 function resolveModelCost(
   raw?: Partial<ModelDefinitionConfig["cost"]>,
@@ -50,330 +81,405 @@ function resolveModelCost(
     cacheRead: typeof raw?.cacheRead === "number" ? raw.cacheRead : DEFAULT_MODEL_COST.cacheRead,
     cacheWrite:
       typeof raw?.cacheWrite === "number" ? raw.cacheWrite : DEFAULT_MODEL_COST.cacheWrite,
+    ...(raw?.tieredPricing ? { tieredPricing: raw.tieredPricing } : {}),
   };
 }
 
-function resolveAnthropicDefaultAuthMode(cfg: ClawdbotConfig): AnthropicAuthDefaultsMode | null {
-  const profiles = cfg.auth?.profiles ?? {};
-  const anthropicProfiles = Object.entries(profiles).filter(
-    ([, profile]) => profile?.provider === "anthropic",
-  );
-
-  const order = cfg.auth?.order?.anthropic ?? [];
-  for (const profileId of order) {
-    const entry = profiles[profileId];
-    if (!entry || entry.provider !== "anthropic") continue;
-    if (entry.mode === "api_key") return "api_key";
-    if (entry.mode === "oauth" || entry.mode === "token") return "oauth";
+export function resolveNormalizedProviderModelMaxTokens(params: {
+  providerId: string;
+  modelId: string;
+  contextWindow: number;
+  rawMaxTokens: number;
+}): number {
+  const clamped = Math.min(params.rawMaxTokens, params.contextWindow);
+  if (normalizeProviderId(params.providerId) !== "mistral") {
+    return clamped;
   }
 
-  const hasApiKey = anthropicProfiles.some(([, profile]) => profile?.mode === "api_key");
-  const hasOauth = anthropicProfiles.some(
-    ([, profile]) => profile?.mode === "oauth" || profile?.mode === "token",
-  );
-  if (hasApiKey && !hasOauth) return "api_key";
-  if (hasOauth && !hasApiKey) return "oauth";
-
-  if (process.env.ANTHROPIC_OAUTH_TOKEN?.trim()) return "oauth";
-  if (process.env.ANTHROPIC_API_KEY?.trim()) return "api_key";
-  return null;
+  const safeMaxTokens = Object.hasOwn(MISTRAL_SAFE_MAX_TOKENS_BY_MODEL, params.modelId)
+    ? MISTRAL_SAFE_MAX_TOKENS_BY_MODEL[
+        params.modelId as keyof typeof MISTRAL_SAFE_MAX_TOKENS_BY_MODEL
+      ]
+    : undefined;
+  if (safeMaxTokens !== undefined) {
+    return Math.min(clamped, safeMaxTokens);
+  }
+  return clamped < params.contextWindow
+    ? clamped
+    : Math.min(MISTRAL_UNKNOWN_MODEL_SAFE_MAX_TOKENS, params.contextWindow);
 }
 
-function resolvePrimaryModelRef(raw?: string): string | null {
-  if (!raw || typeof raw !== "string") return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const aliasKey = trimmed.toLowerCase();
-  return DEFAULT_MODEL_ALIASES[aliasKey] ?? trimmed;
-}
-
-export type SessionDefaultsOptions = {
-  warn?: (message: string) => void;
-  warnState?: WarnState;
-};
-
-export function applyMessageDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
+export function applyMessageDefaults(cfg: OpenClawConfig): OpenClawConfig {
   const messages = cfg.messages;
-  const hasAckScope = messages?.ackReactionScope !== undefined;
-  if (hasAckScope) return cfg;
-
-  const nextMessages = messages ? { ...messages } : {};
-  nextMessages.ackReactionScope = "group-mentions";
-  return {
-    ...cfg,
-    messages: nextMessages,
-  };
-}
-
-export function applySessionDefaults(
-  cfg: ClawdbotConfig,
-  options: SessionDefaultsOptions = {},
-): ClawdbotConfig {
-  const session = cfg.session;
-  if (!session || session.mainKey === undefined) return cfg;
-
-  const trimmed = session.mainKey.trim();
-  const warn = options.warn ?? console.warn;
-  const warnState = options.warnState ?? defaultWarnState;
-
-  const next: ClawdbotConfig = {
-    ...cfg,
-    session: { ...session, mainKey: "main" },
-  };
-
-  if (trimmed && trimmed !== "main" && !warnState.warned) {
-    warnState.warned = true;
-    warn('session.mainKey is ignored; main session is always "main".');
+  if (
+    messages?.ackReactionScope !== undefined &&
+    messages.queue?.allowCollaborativeSteering !== undefined
+  ) {
+    return cfg;
   }
-
-  return next;
-}
-
-export function applyTalkApiKey(config: ClawdbotConfig): ClawdbotConfig {
-  const resolved = resolveTalkApiKey();
-  if (!resolved) return config;
-  const existing = config.talk?.apiKey?.trim();
-  if (existing) return config;
-  return {
-    ...config,
-    talk: {
-      ...config.talk,
-      apiKey: resolved,
-    },
-  };
-}
-
-export function applyModelDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
-  let mutated = false;
-  let nextCfg = cfg;
-
-  const providerConfig = nextCfg.models?.providers;
-  if (providerConfig) {
-    const nextProviders = { ...providerConfig };
-    for (const [providerId, provider] of Object.entries(providerConfig)) {
-      const models = provider.models;
-      if (!Array.isArray(models) || models.length === 0) continue;
-      let providerMutated = false;
-      const nextModels = models.map((model) => {
-        const raw = model as ModelDefinitionLike;
-        let modelMutated = false;
-
-        const reasoning = typeof raw.reasoning === "boolean" ? raw.reasoning : false;
-        if (raw.reasoning !== reasoning) modelMutated = true;
-
-        const input = raw.input ?? [...DEFAULT_MODEL_INPUT];
-        if (raw.input === undefined) modelMutated = true;
-
-        const cost = resolveModelCost(raw.cost);
-        const costMutated =
-          !raw.cost ||
-          raw.cost.input !== cost.input ||
-          raw.cost.output !== cost.output ||
-          raw.cost.cacheRead !== cost.cacheRead ||
-          raw.cost.cacheWrite !== cost.cacheWrite;
-        if (costMutated) modelMutated = true;
-
-        const contextWindow = isPositiveNumber(raw.contextWindow)
-          ? raw.contextWindow
-          : DEFAULT_CONTEXT_TOKENS;
-        if (raw.contextWindow !== contextWindow) modelMutated = true;
-
-        const defaultMaxTokens = Math.min(DEFAULT_MODEL_MAX_TOKENS, contextWindow);
-        const maxTokens = isPositiveNumber(raw.maxTokens) ? raw.maxTokens : defaultMaxTokens;
-        if (raw.maxTokens !== maxTokens) modelMutated = true;
-
-        if (!modelMutated) return model;
-        providerMutated = true;
-        return {
-          ...raw,
-          reasoning,
-          input,
-          cost,
-          contextWindow,
-          maxTokens,
-        } as ModelDefinitionConfig;
-      });
-
-      if (!providerMutated) continue;
-      nextProviders[providerId] = { ...provider, models: nextModels };
-      mutated = true;
-    }
-
-    if (mutated) {
-      nextCfg = {
-        ...nextCfg,
-        models: {
-          ...nextCfg.models,
-          providers: nextProviders,
-        },
-      };
-    }
-  }
-
-  const existingAgent = nextCfg.agents?.defaults;
-  if (!existingAgent) return mutated ? nextCfg : cfg;
-  const existingModels = existingAgent.models ?? {};
-  if (Object.keys(existingModels).length === 0) return mutated ? nextCfg : cfg;
-
-  const nextModels: Record<string, { alias?: string }> = {
-    ...existingModels,
-  };
-
-  for (const [alias, target] of Object.entries(DEFAULT_MODEL_ALIASES)) {
-    const entry = nextModels[target];
-    if (!entry) continue;
-    if (entry.alias !== undefined) continue;
-    nextModels[target] = { ...entry, alias };
-    mutated = true;
-  }
-
-  if (!mutated) return cfg;
-
-  return {
-    ...nextCfg,
-    agents: {
-      ...nextCfg.agents,
-      defaults: { ...existingAgent, models: nextModels },
-    },
-  };
-}
-
-export function applyAgentDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
-  const agents = cfg.agents;
-  const defaults = agents?.defaults;
-  const hasMax =
-    typeof defaults?.maxConcurrent === "number" && Number.isFinite(defaults.maxConcurrent);
-  const hasSubMax =
-    typeof defaults?.subagents?.maxConcurrent === "number" &&
-    Number.isFinite(defaults.subagents.maxConcurrent);
-  if (hasMax && hasSubMax) return cfg;
-
-  let mutated = false;
-  const nextDefaults = defaults ? { ...defaults } : {};
-  if (!hasMax) {
-    nextDefaults.maxConcurrent = DEFAULT_AGENT_MAX_CONCURRENT;
-    mutated = true;
-  }
-
-  const nextSubagents = defaults?.subagents ? { ...defaults.subagents } : {};
-  if (!hasSubMax) {
-    nextSubagents.maxConcurrent = DEFAULT_SUBAGENT_MAX_CONCURRENT;
-    mutated = true;
-  }
-
-  if (!mutated) return cfg;
 
   return {
     ...cfg,
-    agents: {
-      ...agents,
-      defaults: {
-        ...nextDefaults,
-        subagents: nextSubagents,
+    messages: {
+      ...messages,
+      ackReactionScope: messages?.ackReactionScope ?? "group-mentions",
+      queue: {
+        ...messages?.queue,
+        allowCollaborativeSteering: messages?.queue?.allowCollaborativeSteering ?? true,
       },
     },
   };
 }
 
-export function applyLoggingDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
-  const logging = cfg.logging;
-  if (!logging) return cfg;
-  if (logging.redactSensitive) return cfg;
-  return {
+export function applySessionDefaults(cfg: OpenClawConfig): OpenClawConfig {
+  const session = cfg.session;
+  if (!session || session.mainKey === undefined) {
+    return cfg;
+  }
+
+  const trimmed = session.mainKey.trim();
+
+  const next: OpenClawConfig = {
     ...cfg,
-    logging: {
-      ...logging,
-      redactSensitive: "tools",
-    },
+    session: { ...session, mainKey: "main" },
   };
+
+  if (trimmed && trimmed !== "main" && !warnedAboutMainKey) {
+    warnedAboutMainKey = true;
+    console.warn('session.mainKey is ignored; main session is always "main".');
+  }
+
+  return next;
 }
 
-export function applyContextPruningDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
-  const defaults = cfg.agents?.defaults;
-  if (!defaults) return cfg;
+/** Catalog metadata eligible to fill fields the operator did not author. */
+type CatalogSeedModel = Pick<
+  ModelDefinitionConfig,
+  | "api"
+  | "baseUrl"
+  | "input"
+  | "reasoning"
+  | "cost"
+  | "contextWindow"
+  | "contextTokens"
+  | "maxTokens"
+  | "thinkingLevelMap"
+  | "compat"
+>;
 
-  const authMode = resolveAnthropicDefaultAuthMode(cfg);
-  if (!authMode) return cfg;
-
-  let mutated = false;
-  const nextDefaults = { ...defaults };
-  const contextPruning = defaults.contextPruning ?? {};
-  const heartbeat = defaults.heartbeat ?? {};
-
-  if (defaults.contextPruning?.mode === undefined) {
-    nextDefaults.contextPruning = {
-      ...contextPruning,
-      mode: "cache-ttl",
-      ttl: defaults.contextPruning?.ttl ?? "1h",
-    };
-    mutated = true;
+/**
+ * Indexes plugin manifest catalog rows so configured model entries can inherit
+ * metadata the operator omitted. Without this, materialization would turn an
+ * override entry that pins only sizing fields into a text-only, non-reasoning,
+ * zero-cost model — silently dropping vision-gated tools downstream.
+ */
+function buildManifestCatalogModelLookup(
+  manifestRegistry: Pick<PluginManifestRegistry, "plugins"> | undefined,
+  policies: ReturnType<typeof collectManifestModelIdNormalizationPolicies> | undefined,
+  configuredProviderIds: ReadonlySet<string>,
+): (providerId: string, modelId: string) => Partial<CatalogSeedModel> | undefined {
+  const plugins = manifestRegistry?.plugins;
+  if (!plugins || plugins.length === 0) {
+    return () => undefined;
   }
-
-  if (defaults.heartbeat?.every === undefined) {
-    nextDefaults.heartbeat = {
-      ...heartbeat,
-      every: authMode === "oauth" ? "1h" : "30m",
-    };
-    mutated = true;
-  }
-
-  if (authMode === "api_key") {
-    const nextModels = defaults.models ? { ...defaults.models } : {};
-    let modelsMutated = false;
-
-    for (const [key, entry] of Object.entries(nextModels)) {
-      const parsed = parseModelRef(key, "anthropic");
-      if (!parsed || parsed.provider !== "anthropic") continue;
-      const current = entry ?? {};
-      const params = (current as { params?: Record<string, unknown> }).params ?? {};
-      if (typeof params.cacheControlTtl === "string") continue;
-      nextModels[key] = {
-        ...(current as Record<string, unknown>),
-        params: { ...params, cacheControlTtl: "1h" },
-      };
-      modelsMutated = true;
-    }
-
-    const primary = resolvePrimaryModelRef(defaults.model?.primary ?? undefined);
-    if (primary) {
-      const parsedPrimary = parseModelRef(primary, "anthropic");
-      if (parsedPrimary?.provider === "anthropic") {
-        const key = `${parsedPrimary.provider}/${parsedPrimary.model}`;
-        const entry = nextModels[key];
-        const current = entry ?? {};
-        const params = (current as { params?: Record<string, unknown> }).params ?? {};
-        if (typeof params.cacheControlTtl !== "string") {
-          nextModels[key] = {
-            ...(current as Record<string, unknown>),
-            params: { ...params, cacheControlTtl: "1h" },
-          };
-          modelsMutated = true;
+  let index: Map<string, Partial<CatalogSeedModel>> | undefined;
+  const keyFor = (providerId: string, modelId: string) =>
+    normalizeProviderId(providerId) +
+    " " +
+    normalizeConfiguredProviderCatalogModelId(providerId, modelId, policies).toLowerCase();
+  return (providerId, modelId) => {
+    if (!index) {
+      index = new Map();
+      for (const plugin of plugins) {
+        for (const [catalogProviderId, provider] of Object.entries(
+          plugin.modelCatalog?.providers ?? {},
+        )) {
+          if (!configuredProviderIds.has(normalizeProviderId(catalogProviderId))) {
+            continue;
+          }
+          for (const model of provider.models) {
+            const key = keyFor(catalogProviderId, model.id);
+            if (!index.has(key)) {
+              // SAFETY: ModelCatalogModel's seed fields are a structural subset of ModelDefinitionConfig; only the picked metadata fields are read from this entry.
+              const metadata = model as Partial<CatalogSeedModel>;
+              index.set(key, {
+                ...metadata,
+                api: model.api ?? provider.api,
+                baseUrl: model.baseUrl ?? provider.baseUrl,
+              });
+            }
+          }
         }
       }
     }
+    return structuredClone(index.get(keyFor(providerId, modelId)));
+  };
+}
 
-    if (modelsMutated) {
-      nextDefaults.models = nextModels;
-      mutated = true;
+export function applyModelDefaults(
+  cfg: OpenClawConfig,
+  options: ProviderPolicyDefaultsOptions = {},
+): OpenClawConfig {
+  const providerConfig = cfg.models?.providers;
+  const nextProviders = { ...providerConfig };
+  if (providerConfig) {
+    const manifestRegistry = options.manifestRegistry ?? options.loadManifestRegistry?.();
+    const modelIdNormalizationPolicies = manifestRegistry
+      ? collectManifestModelIdNormalizationPolicies(manifestRegistry.plugins)
+      : undefined;
+    const resolveCatalogModel = buildManifestCatalogModelLookup(
+      manifestRegistry,
+      modelIdNormalizationPolicies,
+      new Set(Object.keys(providerConfig).map(normalizeProviderId)),
+    );
+    for (const [providerId, provider] of Object.entries(providerConfig)) {
+      const normalizedProvider = materializeConfiguredProviderModelRows(
+        normalizeProviderConfigForConfigDefaults({
+          provider: providerId,
+          providerConfig: provider,
+          manifestRegistry,
+        }),
+        (modelId) =>
+          normalizeConfiguredProviderCatalogModelId(
+            providerId,
+            modelId,
+            modelIdNormalizationPolicies,
+          ),
+      );
+      const models = normalizedProvider.models;
+      if (!Array.isArray(models) || models.length === 0) {
+        nextProviders[providerId] = normalizedProvider;
+        continue;
+      }
+      const providerApi = normalizedProvider.api;
+      const providerMaxTokens = asPositiveFiniteNumber(normalizedProvider.maxTokens);
+      const nextModels = models.map((model) => {
+        const raw = model as ModelDefinitionLike;
+        const id = raw.id;
+
+        // Config entries are overrides, not full definitions: authored fields
+        // win, the owning catalog row fills omitted fields, and only then do
+        // generic defaults apply. Defaulting straight past the catalog would
+        // erase field absence (for example turning an entry that pins only
+        // contextWindow into a text-only model, dropping vision-gated tools).
+        const catalogModel = resolveCatalogModel(providerId, id);
+        const reasoning =
+          typeof raw.reasoning === "boolean" ? raw.reasoning : (catalogModel?.reasoning ?? false);
+
+        const input = raw.input ?? catalogModel?.input ?? [...DEFAULT_MODEL_INPUT];
+
+        const cost = resolveModelCost(mergeModelCost(catalogModel?.cost, raw.cost));
+        const costMutated =
+          !raw.cost ||
+          raw.cost.input !== cost.input ||
+          raw.cost.output !== cost.output ||
+          raw.cost.cacheRead !== cost.cacheRead ||
+          raw.cost.cacheWrite !== cost.cacheWrite ||
+          raw.cost.tieredPricing !== cost.tieredPricing;
+        const contextWindow =
+          asPositiveFiniteNumber(raw.contextWindow) ??
+          asPositiveFiniteNumber(catalogModel?.contextWindow);
+        const contextTokens =
+          asPositiveFiniteNumber(raw.contextTokens) ??
+          asPositiveFiniteNumber(catalogModel?.contextTokens);
+
+        const maxTokenContextWindow = contextWindow ?? DEFAULT_CONTEXT_TOKENS;
+        // An authored provider cap wins; otherwise size the invented cap to the usable window.
+        const defaultMaxTokens =
+          providerMaxTokens !== undefined
+            ? Math.min(providerMaxTokens, maxTokenContextWindow)
+            : resolveDefaultModelMaxTokens(
+                Math.min(contextTokens ?? maxTokenContextWindow, maxTokenContextWindow),
+              );
+        const rawMaxTokens =
+          asPositiveFiniteNumber(raw.maxTokens) ??
+          asPositiveFiniteNumber(catalogModel?.maxTokens) ??
+          defaultMaxTokens;
+        const maxTokens = resolveNormalizedProviderModelMaxTokens({
+          providerId,
+          modelId: id,
+          contextWindow: maxTokenContextWindow,
+          rawMaxTokens,
+        });
+        const api = raw.api ?? providerApi;
+
+        const thinkingLevelMap =
+          raw.thinkingLevelMap === undefined && catalogModel?.thinkingLevelMap !== undefined
+            ? catalogModel.thinkingLevelMap
+            : undefined;
+        const compat =
+          raw.compat === undefined
+            ? resolveCatalogOwnedModelCompat({
+                catalogRoute: catalogModel,
+                catalogCompat: catalogModel?.compat,
+                configuredRoute: { api, baseUrl: raw.baseUrl ?? normalizedProvider.baseUrl },
+              })
+            : undefined;
+        const modelMutated =
+          raw.reasoning !== reasoning ||
+          raw.input === undefined ||
+          costMutated ||
+          raw.contextWindow !== contextWindow ||
+          raw.contextTokens !== contextTokens ||
+          raw.maxTokens !== maxTokens ||
+          raw.api !== api ||
+          thinkingLevelMap !== undefined ||
+          compat !== undefined;
+        if (!modelMutated) {
+          return model;
+        }
+        return Object.assign(
+          {},
+          raw,
+          {
+            reasoning,
+            input,
+            cost,
+            contextWindow,
+            contextTokens,
+            maxTokens,
+            api,
+          },
+          thinkingLevelMap !== undefined ? { thinkingLevelMap } : {},
+          compat !== undefined ? { compat } : {},
+        ) as ModelDefinitionConfig;
+      });
+
+      nextProviders[providerId] = { ...normalizedProvider, models: nextModels };
     }
   }
 
-  if (!mutated) return cfg;
+  const agents = cfg.agents ? { ...cfg.agents } : undefined;
+  if (agents?.entries) {
+    agents.entries = Object.fromEntries(
+      Object.entries(agents.entries).map(([id, agent]) => {
+        if (!isRecord(agent)) {
+          return [id, agent];
+        }
+        const nextAgent = { ...agent };
+        if (Object.hasOwn(agent, "model")) {
+          nextAgent.model = normalizeAgentModelSelectionForConfig(
+            agent.model,
+          ) as typeof agent.model;
+        }
+        if (isRecord(agent.models)) {
+          nextAgent.models = normalizeAgentModelMapForConfig(agent.models);
+        }
+        return [id, nextAgent];
+      }),
+    );
+  }
 
+  const existingAgent = agents?.defaults;
+  if (agents && existingAgent) {
+    const nextAgent = { ...existingAgent };
+    const normalizedModel = normalizeAgentModelSelectionForConfig(existingAgent.model);
+    if (normalizedModel !== existingAgent.model) {
+      nextAgent.model = normalizedModel as typeof existingAgent.model;
+    }
+    const existingModels = normalizeAgentModelMapForConfig(existingAgent.models ?? {});
+    const nextModels: Record<string, { alias?: string }> = { ...existingModels };
+    for (const [alias, target] of Object.entries(DEFAULT_MODEL_ALIASES)) {
+      const entry = nextModels[target];
+      if (!entry) {
+        continue;
+      }
+      if (entry.alias !== undefined) {
+        continue;
+      }
+      const normalizedAlias = normalizeLowercaseStringOrEmpty(alias);
+      const aliasAlreadyOwned = Object.entries(nextModels).some(
+        ([modelRef, candidate]) =>
+          modelRef !== target &&
+          normalizeLowercaseStringOrEmpty(candidate.alias) === normalizedAlias,
+      );
+      // Preserve explicit alias ownership when a newer default target is also configured.
+      if (aliasAlreadyOwned) {
+        continue;
+      }
+      nextModels[target] = { ...entry, alias };
+    }
+    if (Object.keys(existingModels).length > 0) {
+      nextAgent.models = nextModels;
+    }
+    agents.defaults = nextAgent;
+  }
+
+  return {
+    ...cfg,
+    ...(providerConfig ? { models: { ...cfg.models, providers: nextProviders } } : {}),
+    ...(agents ? { agents } : {}),
+  };
+}
+
+export function applyAgentDefaults(cfg: OpenClawConfig): OpenClawConfig {
+  const defaults = cfg.agents?.defaults;
   return {
     ...cfg,
     agents: {
       ...cfg.agents,
-      defaults: nextDefaults,
+      defaults: {
+        ...defaults,
+        maxConcurrent: asFiniteNumber(defaults?.maxConcurrent) ?? resolveAgentMaxConcurrent(),
+        subagents: {
+          ...defaults?.subagents,
+          maxConcurrent:
+            asFiniteNumber(defaults?.subagents?.maxConcurrent) ?? DEFAULT_SUBAGENT_MAX_CONCURRENT,
+          archiveAfterMinutes:
+            asFiniteNumber(defaults?.subagents?.archiveAfterMinutes) ??
+            DEFAULT_SUBAGENT_ARCHIVE_AFTER_MINUTES,
+        },
+      },
     },
   };
 }
 
-export function applyCompactionDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
+export function hasAnthropicDefaultSignal(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+  if (env.ANTHROPIC_API_KEY?.trim() || env.ANTHROPIC_OAUTH_TOKEN?.trim()) {
+    return true;
+  }
+  const isAnthropicProvider = (provider: string) => {
+    const normalized = normalizeProviderId(provider);
+    return normalized === "anthropic" || normalized === "claude-cli";
+  };
+  const profiles = cfg.auth?.profiles;
+  if (
+    profiles &&
+    Object.values(profiles).some((profile) => isAnthropicProvider(profile?.provider))
+  ) {
+    return true;
+  }
+  const order = cfg.auth?.order;
+  return Object.keys(order ?? {}).some(
+    (provider) => isAnthropicProvider(provider) && order?.[provider] !== undefined,
+  );
+}
+
+export function applyContextPruningDefaults(
+  cfg: OpenClawConfig,
+  options: ProviderPolicyDefaultsOptions = {},
+): OpenClawConfig {
+  if (!cfg.agents?.defaults) {
+    return cfg;
+  }
+  const env = options.env ?? process.env;
+  if (!hasAnthropicDefaultSignal(cfg, env)) {
+    return cfg;
+  }
+  return applyProviderConfigDefaultsForConfig({
+    provider: "anthropic",
+    config: cfg,
+    env,
+    manifestRegistry: options.manifestRegistry,
+    loadManifestRegistry: options.loadManifestRegistry,
+  });
+}
+
+export function applyCompactionDefaults(cfg: OpenClawConfig): OpenClawConfig {
   const defaults = cfg.agents?.defaults;
-  if (!defaults) return cfg;
-  const compaction = defaults?.compaction;
-  if (compaction?.mode) return cfg;
+  if (!defaults || defaults.compaction?.mode) {
+    return cfg;
+  }
 
   return {
     ...cfg,
@@ -382,14 +488,10 @@ export function applyCompactionDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
       defaults: {
         ...defaults,
         compaction: {
-          ...compaction,
+          ...defaults.compaction,
           mode: "safeguard",
         },
       },
     },
   };
-}
-
-export function resetSessionDefaultsWarningForTests() {
-  defaultWarnState = { warned: false };
 }

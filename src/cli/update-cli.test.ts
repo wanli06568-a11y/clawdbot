@@ -1,678 +1,774 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CANCEL_SYMBOL } from "@clack/core";
+import { Command } from "commander";
+import { afterAll, aroundEach, describe, expect, it, vi } from "vitest";
+import { createSqliteReadOnlyWorkerScope } from "../infra/sqlite-readonly-worker.js";
+import { applyDevUpdateTargetEnv } from "../infra/update-dev-target.js";
+import type { UpdateRunResult } from "../infra/update-runner-types.js";
+import { withEnvAsync } from "../test-utils/env.js";
+import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
+import { createCommandResult as commandResult } from "../test-utils/npm-spec-install-test-helpers.js";
+import { VERSION } from "../version.js";
+import { withConsoleLogsRoutedToStderrForJson } from "./json-output-mode.js";
+import * as check from "./update-cli-assertions.test-support.js";
+import { createUpdateCliFixture } from "./update-cli-fixture.test-support.js";
+import * as mocks from "./update-cli-mocks.test-support.js";
+import * as cli from "./update-cli-modules.test-support.js";
+import { writeOpenClawPackageFixture } from "./update-cli/update-cli-package.test-support.js";
 
-import type { UpdateRunResult } from "../infra/update-runner.js";
+await vi.hoisted(() => import("./update-cli-mocks.test-support.js"));
 
-const confirm = vi.fn();
-const select = vi.fn();
-const spinner = vi.fn(() => ({ start: vi.fn(), stop: vi.fn() }));
-const isCancel = (value: unknown) => value === "cancel";
-
-vi.mock("@clack/prompts", () => ({
-  confirm,
-  select,
-  isCancel,
-  spinner,
-}));
-
-// Mock the update-runner module
-vi.mock("../infra/update-runner.js", () => ({
-  runGatewayUpdate: vi.fn(),
-}));
-
-vi.mock("../infra/clawdbot-root.js", () => ({
-  resolveClawdbotPackageRoot: vi.fn(),
-}));
-
-vi.mock("../config/config.js", () => ({
-  readConfigFileSnapshot: vi.fn(),
-  writeConfigFile: vi.fn(),
-}));
-
-vi.mock("../infra/update-check.js", async () => {
-  const actual = await vi.importActual<typeof import("../infra/update-check.js")>(
-    "../infra/update-check.js",
-  );
-  return {
-    ...actual,
-    checkUpdateStatus: vi.fn(),
-    fetchNpmTagVersion: vi.fn(),
-    resolveNpmChannelTag: vi.fn(),
-  };
-});
-
-vi.mock("../process/exec.js", () => ({
-  runCommandWithTimeout: vi.fn(),
-}));
-
-// Mock doctor (heavy module; should not run in unit tests)
-vi.mock("../commands/doctor.js", () => ({
-  doctorCommand: vi.fn(),
-}));
-// Mock the daemon-cli module
-vi.mock("./daemon-cli.js", () => ({
-  runDaemonRestart: vi.fn(),
-}));
-
-// Mock the runtime
-vi.mock("../runtime.js", () => ({
-  defaultRuntime: {
-    log: vi.fn(),
-    error: vi.fn(),
-    exit: vi.fn(),
-  },
-}));
+const {
+  defaultRuntime: runtime,
+  runCommandWithTimeout: runCommand,
+  updateCommand: runUpdate,
+  updateGitCheckout: gitUpdate,
+} = cli;
+const { packageInstallCommandCall: packageInstall, freshRestartCalls: restarts } = check;
 
 describe("update-cli", () => {
-  const baseSnapshot = {
-    valid: true,
-    config: {},
-    issues: [],
-  } as const;
+  // Reuse native reader imports; each request still captures fresh state and admission.
+  const inspectionWorkers = createSqliteReadOnlyWorkerScope();
+  aroundEach((runTest) => inspectionWorkers.run(runTest));
+  afterAll(() => inspectionWorkers.close());
+  const nodeExecutable = resolveTestNodeExecPath();
+  const {
+    configSnapshot,
+    createCaseDir,
+    mockCurrentProcessFreshDoctor,
+    mockFileBackedPathExists,
+    mockNpmGlobalCommands,
+    mockPackageInstallAtCaseDir,
+    mockPackageInstallStatus,
+    setTty,
+    setupNonInteractiveDowngrade,
+    setupInstalledPackageAtNodeModules,
+    runRestartFallbackScenario,
+    tempDirs,
+    mockGatewayHealth,
+    mockGatewayInstallFailure,
+    mockRunningManagedGateway,
+    primeServiceCommand,
+    profileStateDir,
+    setupNpmUpdatedRootRefresh,
+    setupUpdatedRootRefresh,
+  } = createUpdateCliFixture();
 
-  const setTty = (value: boolean | undefined) => {
-    Object.defineProperty(process.stdin, "isTTY", {
-      value,
-      configurable: true,
-    });
-  };
-
-  const setStdoutTty = (value: boolean | undefined) => {
-    Object.defineProperty(process.stdout, "isTTY", {
-      value,
-      configurable: true,
-    });
-  };
-
-  beforeEach(async () => {
-    vi.clearAllMocks();
-    const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
-    const { readConfigFileSnapshot } = await import("../config/config.js");
-    const { checkUpdateStatus, fetchNpmTagVersion, resolveNpmChannelTag } =
-      await import("../infra/update-check.js");
-    const { runCommandWithTimeout } = await import("../process/exec.js");
-    vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(process.cwd());
-    vi.mocked(readConfigFileSnapshot).mockResolvedValue(baseSnapshot);
-    vi.mocked(fetchNpmTagVersion).mockResolvedValue({
-      tag: "latest",
-      version: "9999.0.0",
-    });
-    vi.mocked(resolveNpmChannelTag).mockResolvedValue({
-      tag: "latest",
-      version: "9999.0.0",
-    });
-    vi.mocked(checkUpdateStatus).mockResolvedValue({
-      root: "/test/path",
-      installKind: "git",
-      packageManager: "pnpm",
-      git: {
-        root: "/test/path",
-        sha: "abcdef1234567890",
-        tag: "v1.2.3",
-        branch: "main",
-        upstream: "origin/main",
-        dirty: false,
-        ahead: 0,
-        behind: 0,
-        fetchOk: true,
-      },
-      deps: {
-        manager: "pnpm",
-        status: "ok",
-        lockfilePath: "/test/path/pnpm-lock.yaml",
-        markerPath: "/test/path/node_modules",
-      },
-      registry: {
-        latestVersion: "1.2.3",
-      },
-    });
-    vi.mocked(runCommandWithTimeout).mockResolvedValue({
-      stdout: "",
-      stderr: "",
-      code: 0,
-      signal: null,
-      killed: false,
-    });
-    setTty(false);
-    setStdoutTty(false);
-  });
-
-  it("exports updateCommand and registerUpdateCli", async () => {
-    const { updateCommand, registerUpdateCli, updateWizardCommand } =
-      await import("./update-cli.js");
-    expect(typeof updateCommand).toBe("function");
-    expect(typeof registerUpdateCli).toBe("function");
-    expect(typeof updateWizardCommand).toBe("function");
-  }, 20_000);
-
-  it("updateCommand runs update and outputs result", async () => {
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { defaultRuntime } = await import("../runtime.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    const mockResult: UpdateRunResult = {
-      status: "ok",
-      mode: "git",
-      root: "/test/path",
-      before: { sha: "abc123", version: "1.0.0" },
-      after: { sha: "def456", version: "1.0.1" },
-      steps: [
-        {
-          name: "git fetch",
-          command: "git fetch",
-          cwd: "/test/path",
-          durationMs: 100,
-          exitCode: 0,
-        },
-      ],
-      durationMs: 500,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-
-    await updateCommand({ json: false });
-
-    expect(runGatewayUpdate).toHaveBeenCalled();
-    expect(defaultRuntime.log).toHaveBeenCalled();
-  });
-
-  it("updateStatusCommand prints table output", async () => {
-    const { defaultRuntime } = await import("../runtime.js");
-    const { updateStatusCommand } = await import("./update-cli.js");
-
-    await updateStatusCommand({ json: false });
-
-    const logs = vi.mocked(defaultRuntime.log).mock.calls.map((call) => call[0]);
-    expect(logs.join("\n")).toContain("Clawdbot update status");
-  });
-
-  it("updateStatusCommand emits JSON", async () => {
-    const { defaultRuntime } = await import("../runtime.js");
-    const { updateStatusCommand } = await import("./update-cli.js");
-
-    await updateStatusCommand({ json: true });
-
-    const last = vi.mocked(defaultRuntime.log).mock.calls.at(-1)?.[0];
-    expect(typeof last).toBe("string");
-    const parsed = JSON.parse(String(last));
-    expect(parsed.channel.value).toBe("stable");
-  });
-
-  it("defaults to dev channel for git installs when unset", async () => {
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue({
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
+  it("disarms legacy launchd updater jobs before refusing mutating updates in Nix mode", async () => {
+    await withEnvAsync({ OPENCLAW_NIX_MODE: "1" }, async () => {
+      await expect(runUpdate({ yes: true })).rejects.toThrow("OPENCLAW_NIX_MODE=1");
     });
 
-    await updateCommand({});
-
-    const call = vi.mocked(runGatewayUpdate).mock.calls[0]?.[0];
-    expect(call?.channel).toBe("dev");
+    expect(
+      mocks.launchdUpdateCleanupMocks.disableCurrentOpenClawUpdateLaunchdJob,
+    ).toHaveBeenCalledOnce();
+    check.expectNoSideEffects(gitUpdate, cli.replaceConfigFile, mocks.updateNpmInstalledPlugins);
   });
 
-  it("defaults to stable channel for package installs when unset", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
-    try {
-      await fs.writeFile(
-        path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "1.0.0" }),
-        "utf-8",
-      );
-
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
-      const { runGatewayUpdate } = await import("../infra/update-runner.js");
-      const { checkUpdateStatus } = await import("../infra/update-check.js");
-      const { updateCommand } = await import("./update-cli.js");
-
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
-      vi.mocked(checkUpdateStatus).mockResolvedValue({
-        root: tempDir,
-        installKind: "package",
-        packageManager: "npm",
-        deps: {
-          manager: "npm",
-          status: "ok",
-          lockfilePath: null,
-          markerPath: null,
-        },
-      });
-      vi.mocked(runGatewayUpdate).mockResolvedValue({
-        status: "ok",
-        mode: "npm",
-        steps: [],
-        durationMs: 100,
-      });
-
-      await updateCommand({ yes: true });
-
-      const call = vi.mocked(runGatewayUpdate).mock.calls[0]?.[0];
-      expect(call?.channel).toBe("stable");
-      expect(call?.tag).toBe("latest");
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("uses stored beta channel when configured", async () => {
-    const { readConfigFileSnapshot } = await import("../config/config.js");
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    vi.mocked(readConfigFileSnapshot).mockResolvedValue({
-      ...baseSnapshot,
-      config: { update: { channel: "beta" } },
-    });
-    vi.mocked(runGatewayUpdate).mockResolvedValue({
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
+  it("delegates mutating updates when an external supervisor owns gateway lifecycle", async () => {
+    await withEnvAsync({ OPENCLAW_SUPERVISOR_MODE: "external" }, async () => {
+      await cli.invokeUpdateCli({ yes: true });
     });
 
-    await updateCommand({});
-
-    const call = vi.mocked(runGatewayUpdate).mock.calls[0]?.[0];
-    expect(call?.channel).toBe("beta");
-  });
-
-  it("falls back to latest when beta tag is older than release", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
-    try {
-      await fs.writeFile(
-        path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "1.0.0" }),
-        "utf-8",
-      );
-
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
-      const { readConfigFileSnapshot } = await import("../config/config.js");
-      const { resolveNpmChannelTag } = await import("../infra/update-check.js");
-      const { runGatewayUpdate } = await import("../infra/update-runner.js");
-      const { updateCommand } = await import("./update-cli.js");
-      const { checkUpdateStatus } = await import("../infra/update-check.js");
-
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
-      vi.mocked(readConfigFileSnapshot).mockResolvedValue({
-        ...baseSnapshot,
-        config: { update: { channel: "beta" } },
-      });
-      vi.mocked(checkUpdateStatus).mockResolvedValue({
-        root: tempDir,
-        installKind: "package",
-        packageManager: "npm",
-        deps: {
-          manager: "npm",
-          status: "ok",
-          lockfilePath: null,
-          markerPath: null,
-        },
-      });
-      vi.mocked(resolveNpmChannelTag).mockResolvedValue({
-        tag: "latest",
-        version: "1.2.3-1",
-      });
-      vi.mocked(runGatewayUpdate).mockResolvedValue({
-        status: "ok",
-        mode: "npm",
-        steps: [],
-        durationMs: 100,
-      });
-
-      await updateCommand({});
-
-      const call = vi.mocked(runGatewayUpdate).mock.calls[0]?.[0];
-      expect(call?.channel).toBe("beta");
-      expect(call?.tag).toBe("latest");
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("honors --tag override", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
-    try {
-      await fs.writeFile(
-        path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "1.0.0" }),
-        "utf-8",
-      );
-
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
-      const { runGatewayUpdate } = await import("../infra/update-runner.js");
-      const { updateCommand } = await import("./update-cli.js");
-
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
-      vi.mocked(runGatewayUpdate).mockResolvedValue({
-        status: "ok",
-        mode: "npm",
-        steps: [],
-        durationMs: 100,
-      });
-
-      await updateCommand({ tag: "next" });
-
-      const call = vi.mocked(runGatewayUpdate).mock.calls[0]?.[0];
-      expect(call?.tag).toBe("next");
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("updateCommand outputs JSON when --json is set", async () => {
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { defaultRuntime } = await import("../runtime.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    const mockResult: UpdateRunResult = {
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-    vi.mocked(defaultRuntime.log).mockClear();
-
-    await updateCommand({ json: true });
-
-    const logCalls = vi.mocked(defaultRuntime.log).mock.calls;
-    const jsonOutput = logCalls.find((call) => {
-      try {
-        JSON.parse(call[0] as string);
-        return true;
-      } catch {
-        return false;
-      }
-    });
-    expect(jsonOutput).toBeDefined();
-  });
-
-  it("updateCommand exits with error on failure", async () => {
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { defaultRuntime } = await import("../runtime.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    const mockResult: UpdateRunResult = {
-      status: "error",
-      mode: "git",
-      reason: "rebase-failed",
-      steps: [],
-      durationMs: 100,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-    vi.mocked(defaultRuntime.exit).mockClear();
-
-    await updateCommand({});
-
-    expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
-  });
-
-  it("updateCommand restarts daemon by default", async () => {
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { runDaemonRestart } = await import("./daemon-cli.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    const mockResult: UpdateRunResult = {
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-    vi.mocked(runDaemonRestart).mockResolvedValue(true);
-
-    await updateCommand({});
-
-    expect(runDaemonRestart).toHaveBeenCalled();
-  });
-
-  it("updateCommand skips restart when --no-restart is set", async () => {
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { runDaemonRestart } = await import("./daemon-cli.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    const mockResult: UpdateRunResult = {
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-
-    await updateCommand({ restart: false });
-
-    expect(runDaemonRestart).not.toHaveBeenCalled();
-  });
-
-  it("updateCommand skips success message when restart does not run", async () => {
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { runDaemonRestart } = await import("./daemon-cli.js");
-    const { defaultRuntime } = await import("../runtime.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    const mockResult: UpdateRunResult = {
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-    vi.mocked(runDaemonRestart).mockResolvedValue(false);
-    vi.mocked(defaultRuntime.log).mockClear();
-
-    await updateCommand({ restart: true });
-
-    const logLines = vi.mocked(defaultRuntime.log).mock.calls.map((call) => String(call[0]));
-    expect(logLines.some((line) => line.includes("Daemon restarted successfully."))).toBe(false);
-  });
-
-  it("updateCommand validates timeout option", async () => {
-    const { defaultRuntime } = await import("../runtime.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    vi.mocked(defaultRuntime.error).mockClear();
-    vi.mocked(defaultRuntime.exit).mockClear();
-
-    await updateCommand({ timeout: "invalid" });
-
-    expect(defaultRuntime.error).toHaveBeenCalledWith(expect.stringContaining("timeout"));
-    expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
-  });
-
-  it("persists update channel when --channel is set", async () => {
-    const { writeConfigFile } = await import("../config/config.js");
-    const { runGatewayUpdate } = await import("../infra/update-runner.js");
-    const { updateCommand } = await import("./update-cli.js");
-
-    const mockResult: UpdateRunResult = {
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-
-    await updateCommand({ channel: "beta" });
-
-    expect(writeConfigFile).toHaveBeenCalled();
-    const call = vi.mocked(writeConfigFile).mock.calls[0]?.[0] as {
-      update?: { channel?: string };
-    };
-    expect(call?.update?.channel).toBe("beta");
-  });
-
-  it("requires confirmation on downgrade when non-interactive", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
-    try {
-      setTty(false);
-      await fs.writeFile(
-        path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "2.0.0" }),
-        "utf-8",
-      );
-
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
-      const { resolveNpmChannelTag } = await import("../infra/update-check.js");
-      const { runGatewayUpdate } = await import("../infra/update-runner.js");
-      const { defaultRuntime } = await import("../runtime.js");
-      const { updateCommand } = await import("./update-cli.js");
-      const { checkUpdateStatus } = await import("../infra/update-check.js");
-
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
-      vi.mocked(checkUpdateStatus).mockResolvedValue({
-        root: tempDir,
-        installKind: "package",
-        packageManager: "npm",
-        deps: {
-          manager: "npm",
-          status: "ok",
-          lockfilePath: null,
-          markerPath: null,
-        },
-      });
-      vi.mocked(resolveNpmChannelTag).mockResolvedValue({
-        tag: "latest",
-        version: "0.0.1",
-      });
-      vi.mocked(runGatewayUpdate).mockResolvedValue({
-        status: "ok",
-        mode: "npm",
-        steps: [],
-        durationMs: 100,
-      });
-      vi.mocked(defaultRuntime.error).mockClear();
-      vi.mocked(defaultRuntime.exit).mockClear();
-
-      await updateCommand({});
-
-      expect(defaultRuntime.error).toHaveBeenCalledWith(
-        expect.stringContaining("Downgrade confirmation required."),
-      );
-      expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("allows downgrade with --yes in non-interactive mode", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
-    try {
-      setTty(false);
-      await fs.writeFile(
-        path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "2.0.0" }),
-        "utf-8",
-      );
-
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
-      const { resolveNpmChannelTag } = await import("../infra/update-check.js");
-      const { runGatewayUpdate } = await import("../infra/update-runner.js");
-      const { defaultRuntime } = await import("../runtime.js");
-      const { updateCommand } = await import("./update-cli.js");
-      const { checkUpdateStatus } = await import("../infra/update-check.js");
-
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
-      vi.mocked(checkUpdateStatus).mockResolvedValue({
-        root: tempDir,
-        installKind: "package",
-        packageManager: "npm",
-        deps: {
-          manager: "npm",
-          status: "ok",
-          lockfilePath: null,
-          markerPath: null,
-        },
-      });
-      vi.mocked(resolveNpmChannelTag).mockResolvedValue({
-        tag: "latest",
-        version: "0.0.1",
-      });
-      vi.mocked(runGatewayUpdate).mockResolvedValue({
-        status: "ok",
-        mode: "npm",
-        steps: [],
-        durationMs: 100,
-      });
-      vi.mocked(defaultRuntime.error).mockClear();
-      vi.mocked(defaultRuntime.exit).mockClear();
-
-      await updateCommand({ yes: true });
-
-      expect(defaultRuntime.error).not.toHaveBeenCalledWith(
-        expect.stringContaining("Downgrade confirmation required."),
-      );
-      expect(runGatewayUpdate).toHaveBeenCalled();
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("updateWizardCommand requires a TTY", async () => {
-    const { defaultRuntime } = await import("../runtime.js");
-    const { updateWizardCommand } = await import("./update-cli.js");
-
-    setTty(false);
-    vi.mocked(defaultRuntime.error).mockClear();
-    vi.mocked(defaultRuntime.exit).mockClear();
-
-    await updateWizardCommand({});
-
-    expect(defaultRuntime.error).toHaveBeenCalledWith(
-      expect.stringContaining("Update wizard requires a TTY"),
+    expect(runtime.exit).toHaveBeenCalledWith(1);
+    expect(mocks.runtimeCapture.error).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Use the external supervisor's update workflow so it can stop the gateway",
+      ),
     );
-    expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
+    check.expectNoSideEffects(
+      gitUpdate,
+      cli.readConfigFileSnapshot,
+      cli.replaceConfigFile,
+      mocks.updateNpmInstalledPlugins,
+    );
   });
 
-  it("updateWizardCommand offers dev checkout and forwards selections", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-wizard-"));
-    const previousGitDir = process.env.CLAWDBOT_GIT_DIR;
+  it("logs friendly hint with manual refresh command when completion cache write times out", async () => {
+    const root = createCaseDir("openclaw-completion-timeout-msg");
+    mocks.pathExists.mockResolvedValue(true);
+    vi.mocked(runCommand).mockResolvedValueOnce(
+      commandResult({ code: 124, killed: true, termination: "timeout" }),
+    );
+    vi.mocked(mocks.runtimeCapture.log).mockClear();
+
+    await cli.updateCliShared.tryWriteCompletionCache(root, false);
+
+    const logOutput = check.getLogOutput();
+    expect(logOutput).toContain("timed out after 30s");
+    expect(logOutput).toContain("openclaw completion --write-state");
+  });
+
+  it("keeps update completion refresh best-effort when profile install fails", async () => {
+    cli.mockGitUpdateAfterMutation(cli.makeOkUpdateResult({ after: { version: VERSION } }), false, {
+      databaseEngines: ["sqlite", "postgres"],
+    });
+    setTty(true);
+    mocks.checkShellCompletionStatus.mockResolvedValue({
+      shell: "zsh",
+      profileInstalled: true,
+      cacheExists: true,
+      cachePath: "/tmp/openclaw-completion.zsh",
+      usesSlowPattern: true,
+    });
+    mocks.installCompletion.mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    await runUpdate({ yes: true, restart: false });
+
+    const logOutput = check.getLogOutput();
+    expect(logOutput).toContain("Shell completion refresh failed: EACCES: permission denied");
+    expect(runtime.exit).not.toHaveBeenCalledWith(1);
+  });
+
+  it("prompts for optional shell completion setup without --yes", async () => {
+    cli.mockGitUpdateAfterMutation(cli.makeOkUpdateResult({ after: { version: VERSION } }), false, {
+      databaseEngines: ["sqlite", "postgres"],
+    });
+    setTty(true);
+    mocks.confirm.mockResolvedValue(true);
+
+    await runUpdate({ yes: false, restart: false });
+
+    expect(mocks.confirm).toHaveBeenCalledOnce();
+    expect(mocks.installCompletion).toHaveBeenCalledWith("zsh", false, "openclaw");
+  });
+
+  it.each([false, true])(
+    "renders update status before invalid config warnings with json=%s",
+    async (json) => {
+      const sourceConfig = {
+        update: { channel: "dev" as const },
+        meta: { lastTouchedVersion: "2026.7.35", lastTouchedAt: "2026-07-31T12:00:00.000Z" },
+      };
+      vi.mocked(cli.readSourceConfigBestEffort).mockResolvedValue(sourceConfig);
+
+      await cli.updateStatusCommand({ json });
+
+      const issue = 'meta: Unrecognized key: "lastTouchedAt"';
+      if (json) {
+        expect(
+          check.requireValue(check.lastWriteJsonCall(), "update status JSON output"),
+        ).toMatchObject({
+          channel: { value: "dev", config: "dev" },
+          configWarnings: expect.arrayContaining([
+            expect.stringContaining(issue),
+            expect.stringContaining("openclaw doctor --fix"),
+          ]),
+        });
+      } else {
+        const output = check.getLogOutput();
+        expect(output).toContain("OpenClaw update status");
+        expect(output).toContain(`Warning: ${issue}`);
+        expect(output).toContain("openclaw doctor --fix");
+        expect(output.indexOf(`Warning: ${issue}`)).toBeGreaterThan(output.indexOf("Channel"));
+      }
+      expect(cli.checkUpdateStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ useDetachedDevUpstream: true }),
+      );
+      expect(cli.readSourceConfigBestEffort).toHaveBeenCalledOnce();
+      expect(cli.readConfigFileSnapshot).not.toHaveBeenCalled();
+      expect(sourceConfig.meta.lastTouchedAt).toBe("2026-07-31T12:00:00.000Z");
+    },
+  );
+
+  it.each([
+    {
+      name: "one-off tag with stored dev",
+      installKind: "package",
+      storedChannel: "dev",
+      tag: "latest",
+      channel: undefined,
+    },
+    {
+      name: "explicit beta from Git",
+      installKind: "git",
+      storedChannel: undefined,
+      tag: undefined,
+      channel: "beta",
+    },
+  ] as const)(
+    "routes package updates for $name",
+    async ({ installKind, storedChannel, tag, channel }) => {
+      await mockPackageInstallAtCaseDir();
+      if (installKind === "git") {
+        vi.mocked(cli.resolveUpdateInstallKind).mockResolvedValue("git");
+        vi.mocked(cli.resolveUpdateInstallIdentity).mockResolvedValue({ installKind: "git" });
+      }
+      if (storedChannel) {
+        vi.mocked(cli.readConfigFileSnapshot).mockResolvedValue(
+          configSnapshot({ update: { channel: storedChannel } }),
+        );
+      }
+      await runUpdate({ yes: true, tag, channel });
+      check.expectPackageInstallSpec("openclaw@9999.0.0");
+      if (channel) {
+        expect(cli.replaceConfigFile).toHaveBeenCalledTimes(1);
+        expect(check.lastReplaceConfigCall()?.nextConfig?.update?.channel).toBe(channel);
+      }
+    },
+  );
+
+  it("installs the verified exact package and persists an explicit extended-stable channel", async () => {
+    await mockPackageInstallAtCaseDir();
+    mocks.readPackageVersion.mockResolvedValueOnce("1.0.0").mockResolvedValue("2026.6.33");
+
+    await runUpdate({ channel: "extended-stable", yes: true, restart: false });
+
+    expect(cli.resolveExtendedStablePackage).toHaveBeenCalledWith({
+      installKind: "package",
+      timeoutMs: undefined,
+      packageName: "openclaw",
+    });
+    check.expectPackageInstallSpec("openclaw@2026.6.33");
+    expect(check.lastReplaceConfigCall()?.nextConfig?.update?.channel).toBe("extended-stable");
+    expect(check.syncPluginCall()?.channel).toBe("extended-stable");
+    expect(check.syncPluginCall()?.coreVersion).toBe("2026.6.33");
+    expect(check.lastNpmPluginUpdateCall()?.updateChannel).toBe("extended-stable");
+    expect(check.lastNpmPluginUpdateCall()?.coreVersion).toBe("2026.6.33");
+  });
+
+  it("rejects --tag for a stored extended-stable channel", async () => {
+    await mockPackageInstallAtCaseDir();
+    vi.mocked(cli.readConfigFileSnapshot).mockResolvedValue(
+      configSnapshot({ update: { channel: "extended-stable" } }),
+    );
+
+    await expect(runUpdate({ tag: "latest", yes: true })).rejects.toEqual(new cli.ExitError(1));
+
+    expect(cli.resolveExtendedStablePackage).not.toHaveBeenCalled();
+    expect(packageInstall()?.[0]).toBeUndefined();
+    check.expectNoSideEffects(
+      cli.replaceConfigFile,
+      mocks.launchdUpdateCleanupMocks.disableCurrentOpenClawUpdateLaunchdJob,
+    );
+    expect(runtime.exit).not.toHaveBeenCalled();
+  });
+
+  it("rejects extended-stable Git updates before handoff, conversion, or config mutation", async () => {
+    await expect(runUpdate({ channel: "extended-stable", yes: true })).rejects.toEqual(
+      new cli.ExitError(1),
+    );
+
+    check.expectNoSideEffects(
+      cli.resolveExtendedStablePackage,
+      gitUpdate,
+      cli.replaceConfigFile,
+      mocks.launchdUpdateCleanupMocks.disableCurrentOpenClawUpdateLaunchdJob,
+    );
+    expect(
+      check.commandCalls().every(([argv]) => argv[0] === "git" && argv.includes("rev-parse")),
+    ).toBe(true);
+    expect(runtime.exit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "update status command invalid timeout",
+      argv: ["update", "status", "--timeout", "invalid"],
+      requireTty: false,
+      expectedError: "--timeout must be a positive integer (seconds)",
+    },
+    {
+      name: "update repair invalid timeout",
+      argv: ["update", "repair", "--timeout", "invalid"],
+      requireTty: false,
+      expectedError: "--timeout must be a positive integer (seconds)",
+    },
+    {
+      name: "update wizard requires a TTY",
+      argv: ["update", "wizard"],
+      requireTty: false,
+      expectedError:
+        "Update wizard requires a TTY. Use `openclaw update --channel <stable|extended-stable|beta|dev>` instead.",
+    },
+  ] as const)(
+    "validates update command invocation errors: $name",
+    async ({ argv, requireTty, expectedError }) => {
+      setTty(requireTty);
+      vi.mocked(runtime.error).mockClear();
+      vi.mocked(runtime.exit).mockClear();
+      const runsBefore = cli.listUpdateRuns();
+      const program = new Command();
+      cli.registerUpdateCli(program);
+
+      await program.parseAsync([...argv], { from: "user" });
+
+      expect(vi.mocked(runtime.error).mock.calls).toEqual([[expectedError]]);
+      expect(vi.mocked(runtime.exit).mock.calls).toEqual([[1]]);
+      expect(cli.listUpdateRuns()).toEqual(runsBefore);
+      check.expectNoSideEffects(
+        cli.readConfigFileSnapshot,
+        cli.runDaemonInstall,
+        cli.runDaemonRestart,
+      );
+    },
+  );
+
+  it("routes an invalid wizard timeout to the outer JSON error owner", async () => {
+    setTty(true);
+    const previousArgv = process.argv;
+    process.argv = ["node", "openclaw", "update", "--json", "wizard", "--timeout", "invalid"];
+    const program = new Command();
+    cli.registerUpdateCli(program);
+    const runsBefore = cli.listUpdateRuns();
     try {
-      setTty(true);
-      process.env.CLAWDBOT_GIT_DIR = tempDir;
-
-      const { checkUpdateStatus } = await import("../infra/update-check.js");
-      const { runGatewayUpdate } = await import("../infra/update-runner.js");
-      const { updateWizardCommand } = await import("./update-cli.js");
-
-      vi.mocked(checkUpdateStatus).mockResolvedValue({
-        root: "/test/path",
-        installKind: "package",
-        packageManager: "npm",
-        deps: {
-          manager: "npm",
-          status: "ok",
-          lockfilePath: null,
-          markerPath: null,
-        },
-      });
-      select.mockResolvedValue("dev");
-      confirm.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
-      vi.mocked(runGatewayUpdate).mockResolvedValue({
-        status: "ok",
-        mode: "git",
-        steps: [],
-        durationMs: 100,
-      });
-
-      await updateWizardCommand({});
-
-      const call = vi.mocked(runGatewayUpdate).mock.calls[0]?.[0];
-      expect(call?.channel).toBe("dev");
+      await expect(
+        withConsoleLogsRoutedToStderrForJson(process.argv, () => program.parseAsync(process.argv)),
+      ).rejects.toThrow("--timeout must be a positive integer (seconds)");
     } finally {
-      process.env.CLAWDBOT_GIT_DIR = previousGitDir;
-      await fs.rm(tempDir, { recursive: true, force: true });
+      process.argv = previousArgv;
     }
+
+    expect(cli.listUpdateRuns()).toEqual(runsBefore);
+    check.expectNoSideEffects(
+      runtime.error,
+      runtime.exit,
+      runtime.writeJson,
+      cli.readConfigFileSnapshot,
+      cli.runDaemonInstall,
+      cli.runDaemonRestart,
+    );
+  });
+
+  it.each([
+    {
+      name: "requires confirmation without --yes",
+      options: {},
+      shouldExit: true,
+      shouldRunPackageUpdate: false,
+    },
+    {
+      name: "allows downgrade with --yes",
+      options: { yes: true },
+      shouldExit: false,
+      shouldRunPackageUpdate: true,
+    },
+  ])("$name in non-interactive mode", async ({ options, shouldExit, shouldRunPackageUpdate }) => {
+    const root = await setupNonInteractiveDowngrade();
+    const runsBefore = cli.listUpdateRuns();
+    if (shouldRunPackageUpdate) {
+      mockCurrentProcessFreshDoctor({ packageRoot: root, postCoreResumeAttempt: false });
+    }
+    if (shouldExit) {
+      await expect(runUpdate(options)).rejects.toEqual(new cli.ExitError(1));
+      expect(cli.listUpdateRuns()).toEqual(runsBefore);
+      await expect(fs.stat(`${profileStateDir()}.update-captures`)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      check.expectNoSideEffects(
+        cli.replaceConfigFile,
+        cli.mutateConfigFileWithRetry,
+        cli.runDaemonInstall,
+        cli.runDaemonRestart,
+      );
+    } else {
+      await runUpdate(options);
+    }
+    expect(check.getLogOutput().includes("Downgrade confirmation required.")).toBe(shouldExit);
+    check.expectNoSideEffects(runtime.exit, gitUpdate);
+    expect(
+      vi
+        .mocked(runCommand)
+        .mock.calls.some(
+          (call) => Array.isArray(call[0]) && call[0][0] === "npm" && call[0][1] === "i",
+        ),
+    ).toBe(shouldRunPackageUpdate);
+  });
+
+  it.each(["channel", "restart"])(
+    "cancels the wizard at %s without inspecting update freshness",
+    async (prompt) => {
+      setTty(true);
+      if (prompt === "channel") {
+        mocks.select.mockResolvedValue(CANCEL_SYMBOL);
+      } else {
+        mocks.confirm.mockResolvedValue(CANCEL_SYMBOL);
+      }
+      vi.mocked(cli.checkUpdateStatus).mockRejectedValue(
+        new Error("Freshness inspection unavailable"),
+      );
+
+      await cli.updateWizardCommand();
+
+      expect(mocks.select).toHaveBeenCalledWith(
+        expect.objectContaining({ message: "Update channel" }),
+      );
+      expect(runtime.log).toHaveBeenCalledWith(expect.stringContaining("Update cancelled."));
+      check.expectNoSideEffects(gitUpdate, mocks.sourceRuntimeCompletion);
+    },
+  );
+
+  it("update wizard forwards explicit consent before the subcommand", async () => {
+    const root = await fs.realpath(tempDirs.make("openclaw-update-wizard-"));
+    const tempDir = path.join(root, "openclaw");
+    const nodeModules = path.join(root, "prefix", "lib", "node_modules");
+    const packageRoot = path.join(nodeModules, "openclaw");
+    const sha = "a".repeat(40);
+    const databaseEngines = ["sqlite", "postgres"];
+    await writeOpenClawPackageFixture(packageRoot, "2026.4.10", { inventory: true });
+    mockPackageInstallStatus(packageRoot);
+    mockFileBackedPathExists();
+    mockNpmGlobalCommands(
+      nodeModules,
+      async (argv) => {
+        if (argv[0] === "git" && argv[1] === "clone") {
+          const stagingDir = check.requireValue(argv.at(-1), "clone destination");
+          await writeOpenClawPackageFixture(stagingDir, VERSION, {
+            git: true,
+            databaseEngines,
+          });
+          return commandResult();
+        }
+        return undefined;
+      },
+      tempDir,
+    );
+    vi.spyOn(cli.updateCliShared, "tryWriteCompletionCache").mockResolvedValueOnce("completed");
+    await withEnvAsync({ OPENCLAW_GIT_DIR: tempDir }, async () => {
+      setTty(true);
+      mocks.select.mockResolvedValue("dev");
+      mocks.confirm.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+      vi.mocked(gitUpdate).mockImplementation(async ({ opts: options }) => {
+        await writeOpenClawPackageFixture(tempDir, VERSION, {
+          git: true,
+          builtSha: sha,
+          databaseEngines,
+        });
+        await options.prepareGitExposure?.(tempDir, sha, undefined);
+        await options.validateCandidate(tempDir);
+        await check.requireValue(
+          options.beforeGitMutation,
+          "Git mutation admission",
+        )({
+          databaseEngines,
+        });
+        return cli.makeOkUpdateResult({
+          root: tempDir,
+          after: { sha, version: VERSION },
+        });
+      });
+      const runFixtureExec = check.requireValue(
+        vi.mocked(cli.runExec).getMockImplementation(),
+        "exec fixture",
+      );
+      vi.mocked(cli.runExec).mockImplementation((file, args, options) => {
+        if (
+          args.length === 3 &&
+          args[0] === path.join(tempDir, "dist", "entry.js") &&
+          args[1] === "update" &&
+          args[2] === "--help"
+        ) {
+          return Promise.resolve({
+            stdout: new Command("update").option("--accept-capabilities").helpInformation(),
+            stderr: "",
+          });
+        }
+        return runFixtureExec(file, args, options);
+      });
+
+      const program = new Command();
+      program.exitOverride();
+      cli.registerUpdateCli(program);
+      await program.parseAsync(["node", "openclaw", "update", "--accept-capabilities", "wizard"]);
+
+      expect(cli.readConfigFileSnapshot).toHaveBeenCalledWith({ observe: false });
+      const call = vi.mocked(gitUpdate).mock.calls[0]?.[0];
+      expect(call?.opts.channel).toBe("dev");
+      await expect(fs.realpath(packageRoot)).resolves.toBe(tempDir);
+      // Directory-observation helpers can also spawn while the update runs.
+      const updateInvocations = mocks.spawn.mock.calls
+        .map(([, args]) => args)
+        .filter((args) => args[1] === "update");
+      expect(updateInvocations).toEqual([
+        [
+          path.join(tempDir, "dist", "entry.js"),
+          "update",
+          "--no-restart",
+          "--accept-capabilities",
+          "--timeout",
+          "1800",
+        ],
+      ]);
+      check.expectNoSideEffects(mocks.syncPluginsForUpdateChannel, mocks.updateNpmInstalledPlugins);
+      expect(runtime.exit).not.toHaveBeenCalledWith(1);
+    });
+  });
+
+  it.each([
+    {
+      name: "versioned tracked target",
+      env: applyDevUpdateTargetEnv(
+        {},
+        { mode: "tracked", upstreamRef: "origin/main", upstreamSha: "frozen-sha" },
+      ),
+      expected: { mode: "tracked", upstreamRef: "origin/main", upstreamSha: "frozen-sha" },
+    },
+  ])("maps the internal dev target environment $name", async ({ env, expected }) => {
+    await withEnvAsync(env, async () => {
+      await runUpdate({ channel: "dev", yes: true, restart: false });
+    });
+
+    expect(vi.mocked(gitUpdate).mock.calls[0]?.[0]?.opts).toEqual(
+      expect.objectContaining({ devTarget: expected }),
+    );
+  });
+
+  it.each([cli.devTargetRefusalCases[4]])(
+    "rejects a %s dev target before running the update",
+    async (_name, value) => {
+      const diagnostic =
+        "Invalid internal OPENCLAW_UPDATE_DEV_TARGET_REF contract; expected a plain Git ref or a supported tracked-target encoding.";
+      await withEnvAsync({ OPENCLAW_UPDATE_DEV_TARGET_REF: value }, async () => {
+        const command = cli.invokeUpdateCli({
+          json: true,
+          yes: true,
+          restart: false,
+        });
+        await expect(command).rejects.toEqual(new cli.ExitError(1));
+      });
+
+      expect(runtime.error).toHaveBeenCalledExactlyOnceWith(diagnostic);
+      expect(runtime.exit).not.toHaveBeenCalled();
+      check.expectNoSideEffects(
+        cli.runUpdateFailureTriage,
+        gitUpdate,
+        cli.replaceConfigFile,
+        cli.mutateConfigFileWithRetry,
+        cli.runDaemonInstall,
+        cli.runDaemonRestart,
+        mocks.syncPluginsForUpdateChannel,
+        mocks.updateNpmInstalledPlugins,
+        mocks.launchdUpdateCleanupMocks.disableCurrentOpenClawUpdateLaunchdJob,
+      );
+      const runs = cli.listUpdateRuns();
+      expect(runs).toHaveLength(1);
+      expect(runtime.writeJson).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          status: "error",
+          reason: "invalid-dev-target",
+          runId: runs[0]?.runId,
+          failedStep: expect.objectContaining({
+            name: "invalid-dev-target",
+            exitCode: 1,
+            stderrTail: diagnostic,
+            failureFacts: [
+              { check: "invalid-dev-target", code: "invalid-dev-target", message: diagnostic },
+            ],
+          }),
+          run: expect.objectContaining({
+            runId: runs[0]?.runId,
+            status: "failed",
+            phase: "finished",
+            reason: "invalid-dev-target",
+          }),
+        }),
+      );
+      expect(runs[0]).toMatchObject({
+        status: "failed",
+        phase: "finished",
+        reason: "invalid-dev-target",
+        origin: { nextAction: diagnostic },
+      });
+      expect(runs[0]?.steps).toContainEqual(
+        expect.objectContaining({ step: "invalid-dev-target", status: "failed", exitCode: 1 }),
+      );
+    },
+  );
+
+  it.each(["error", "skipped"] as const)("explains edited files (%s)", async (status) => {
+    vi.mocked(runtime.log).mockClear();
+    vi.mocked(runtime.error).mockClear();
+    vi.mocked(runtime.exit).mockClear();
+    vi.mocked(gitUpdate).mockResolvedValue({
+      status,
+      mode: "git",
+      reason: "dirty",
+      steps: [],
+      durationMs: 100,
+    } satisfies UpdateRunResult);
+
+    await expect(runUpdate({ channel: "dev" })).rejects.toEqual(new cli.ExitError(1));
+
+    const logs = check.getLogOutput();
+    expect(logs).toContain(`OpenClaw update ${status === "error" ? "failed" : "skipped"}: dirty.`);
+    expect(logs).toContain(
+      "Local changes prevented this update before installation. Your checkout was preserved.",
+    );
+    expect(logs).toContain("Commit your changes and retry, or run `openclaw triage` for help.");
+    expect(cli.listUpdateRuns({ limit: 1 })[0]?.origin.nextAction).toContain(
+      "Commit your changes and retry",
+    );
+    check.expectNoSideEffects(mocks.serviceStop, runtime.exit);
+  });
+  it("reports activation failure when the updated CLI entrypoint is missing", async () => {
+    const root = await mockPackageInstallAtCaseDir();
+    mockRunningManagedGateway([
+      nodeExecutable,
+      path.join(root, "dist", "index.js"),
+      "gateway",
+      "run",
+    ]);
+    vi.mocked(cli.resolveGatewayInstallEntrypoint).mockReset().mockResolvedValue(undefined);
+    mocks.serviceLoaded.mockResolvedValue(true);
+    vi.mocked(cli.runDaemonInstall).mockRejectedValueOnce(new Error("refresh failed"));
+
+    await expect(runUpdate({ yes: true })).rejects.toEqual(new cli.ExitError(1));
+
+    check.expectNoSideEffects(cli.runDaemonInstall, mocks.serviceStart);
+    expect(restarts().length).toBe(0);
+    expect(runtime.exit).not.toHaveBeenCalled();
+  });
+
+  it("tries the updated install restart when package service refresh fails in JSON mode", async () => {
+    const { updatedRoot, updatedEntrypoint } = setupNpmUpdatedRootRefresh();
+    mocks.serviceLoaded.mockResolvedValue(true);
+    primeServiceCommand([nodeExecutable, updatedEntrypoint, "gateway", "run"]);
+    mockGatewayInstallFailure(updatedEntrypoint, "runtime warning");
+    mockGatewayHealth("2026.4.24", "updated-gateway");
+
+    await runUpdate({ yes: true, json: true });
+
+    expect(check.gatewayCommandCall(updatedEntrypoint, "install")).toBeDefined();
+    const restartCall = check.gatewayCommandCall(updatedEntrypoint, "restart");
+    expect(restartCall?.[0].slice(4)).toEqual([
+      "--preserve-definition",
+      "--json",
+      "--update-executor",
+      "run",
+    ]);
+    expect(restartCall?.[1].cwd).toBe(updatedRoot);
+    expect(runtime.exit).not.toHaveBeenCalledWith(1);
+    expect(check.getErrorOutput()).toContain(
+      "SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: Error: launchctl bootstrap failed",
+    );
+  });
+
+  it("warns without restarting a stale same-version service when installation reconciliation fails", async () => {
+    const oldRoot = createCaseDir("openclaw-old-root");
+    const updatedRoot = createCaseDir("openclaw-updated-root");
+    const oldEntrypoint = path.join(oldRoot, "dist", "entry.js");
+    const updatedEntrypoint = path.join(updatedRoot, "dist", "entry.js");
+    setupUpdatedRootRefresh({
+      entrypoints: [oldEntrypoint, updatedEntrypoint],
+      targetVersion: "2026.4.24",
+      gatewayUpdateImpl: async () =>
+        cli.makeOkUpdateResult({
+          mode: "npm",
+          root: updatedRoot,
+          before: { version: "2026.4.24" },
+          after: { version: "2026.4.24" },
+        }),
+    });
+    mocks.serviceLoaded.mockResolvedValue(true);
+    primeServiceCommand([nodeExecutable, oldEntrypoint, "gateway", "run"]);
+    mockGatewayInstallFailure(updatedEntrypoint);
+    mockGatewayHealth("2026.4.24", "matching-old-service");
+
+    await runUpdate({ yes: true });
+
+    expect(check.gatewayCommandCall(updatedEntrypoint, "install")?.[0]).toContain("--force");
+    expect(check.gatewayCommandCall(updatedEntrypoint, "restart")).toBeUndefined();
+    check.expectNoSideEffects(mocks.serviceStop, mocks.serviceStart, mocks.serviceRestart);
+    expect(restarts()).toHaveLength(0);
+    expect(check.getErrorOutput()).toContain(
+      `Failed to reconcile gateway service with ${updatedRoot}`,
+    );
+    expect(runtime.exit).not.toHaveBeenCalledWith(1);
+  });
+
+  it("shows the matching-version probe failure when a JSON package update restart stays unhealthy", async () => {
+    setupNpmUpdatedRootRefresh();
+    mocks.serviceLoaded.mockResolvedValue(true);
+    mocks.restartHealthTestControl.snapshot = {
+      runtime: { status: "running", pid: mocks.gatewayFixturePid },
+      portUsage: {
+        port: 18789,
+        status: "busy",
+        listeners: [{ pid: mocks.gatewayFixturePid, command: "openclaw-gateway" }],
+        hints: [],
+      },
+      healthy: false,
+      staleGatewayPids: [],
+      gatewayVersion: "2026.4.24",
+      expectedVersion: "2026.4.24",
+      probeError: "timeout",
+      waitOutcome: "timeout",
+      elapsedMs: 60_000,
+    };
+
+    await expect(runUpdate({ yes: true, json: true, timeout: "123" })).rejects.toEqual(
+      new cli.ExitError(1),
+    );
+
+    expect(check.lastWriteJsonCall()).toMatchObject({
+      status: "error",
+      steps: expect.arrayContaining([
+        expect.objectContaining({ name: "gateway verification", exitCode: 1 }),
+      ]),
+    });
+    const diagnostics = check.getErrorOutput();
+    expect(runtime.exit).not.toHaveBeenCalled();
+    expect(diagnostics).toContain("Gateway check failed: timeout");
+    expect(diagnostics).toContain("Port 18789 is already in use.");
+    expect(diagnostics).not.toContain("Gateway version mismatch");
+  });
+  it("routes a stored dev channel on package installs to the existing Git checkout", async () => {
+    vi.mocked(cli.readConfigFileSnapshot).mockResolvedValue(
+      configSnapshot({ update: { channel: "dev" } }),
+    );
+    const prefix = createCaseDir("openclaw-update-git-prefix");
+    const { nodeModules } = await setupInstalledPackageAtNodeModules(
+      path.join(prefix, "lib", "node_modules"),
+      "1.0.0",
+    );
+    const gitRoot = createCaseDir("openclaw-update-git");
+    const sha = "a".repeat(40);
+    await writeOpenClawPackageFixture(gitRoot, VERSION, {
+      databaseEngines: ["sqlite", "postgres"],
+      git: true,
+      builtSha: sha,
+      entrySource: "export {};\n",
+    });
+    const canonicalGitRoot = await fs.realpath(gitRoot);
+    vi.mocked(cli.resolveUpdateInstallKind).mockImplementation(async (root) =>
+      root === canonicalGitRoot ? "git" : "package",
+    );
+    vi.mocked(cli.resolveUpdateInstallIdentity).mockImplementation(async ({ root }) => ({
+      installKind: root === canonicalGitRoot ? "git" : "package",
+    }));
+    mockFileBackedPathExists();
+    mockNpmGlobalCommands(nodeModules, undefined, canonicalGitRoot);
+    cli.mockGitUpdateAfterMutation(
+      cli.makeOkUpdateResult({
+        mode: "git",
+        root: canonicalGitRoot,
+        after: { sha, version: VERSION },
+      }),
+      false,
+      { databaseEngines: ["sqlite", "postgres"] },
+    );
+    await withEnvAsync({ OPENCLAW_GIT_DIR: gitRoot }, () => runUpdate({ yes: true }));
+    check.expectUpdateCallChannel("dev");
+  });
+
+  it("uses the installed Git CLI when service env refresh cannot complete", async () => {
+    await runRestartFallbackScenario({ daemonInstall: "fail" });
+    check.expectNoSideEffects(cli.runDaemonInstall, cli.runDaemonRestart);
+  });
+  it("defaults to dev channel for git installs when unset", async () => {
+    const root = createCaseDir("openclaw-routing-legacy-git");
+    await writeOpenClawPackageFixture(root, "1.0.0", { git: true, entrySource: "export {};\n" });
+    mockFileBackedPathExists();
+    const canonicalRoot = await fs.realpath(root);
+    vi.mocked(cli.resolveOpenClawPackageRoot).mockResolvedValue(canonicalRoot);
+    vi.mocked(cli.resolveOpenClawPackageRootSync).mockReturnValue(canonicalRoot);
+    vi.mocked(cli.resolveUpdateInstallKind).mockImplementation(async (target) => {
+      expect(target).toBe(canonicalRoot);
+      return "git";
+    });
+    cli.mockGitUpdateAfterMutation(cli.makeOkUpdateResult({ mode: "git", root: canonicalRoot }));
+    await runUpdate({});
+    check.expectUpdateCallChannel("dev");
   });
 });

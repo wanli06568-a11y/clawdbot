@@ -1,20 +1,20 @@
-import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
+import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 
-import { zaloDock, zaloPlugin } from "./src/channel.js";
-import { handleZaloWebhookRequest } from "./src/monitor.js";
-import { setZaloRuntime } from "./src/runtime.js";
-
-const plugin = {
+export default defineBundledChannelEntry({
   id: "zalo",
   name: "Zalo",
-  description: "Zalo channel plugin (Bot API)",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: ClawdbotPluginApi) {
-    setZaloRuntime(api.runtime);
-    api.registerChannel({ plugin: zaloPlugin, dock: zaloDock });
-    api.registerHttpHandler(handleZaloWebhookRequest);
+  description: "Zalo channel plugin",
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./channel-plugin-api.js",
+    exportName: "zaloPlugin",
   },
-};
-
-export default plugin;
+  secrets: {
+    specifier: "./secret-contract-api.js",
+    exportName: "channelSecrets",
+  },
+  runtime: {
+    specifier: "./runtime-api.js",
+    exportName: "setZaloRuntime",
+  },
+});

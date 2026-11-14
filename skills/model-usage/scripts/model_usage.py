@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import math
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -17,12 +17,24 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
 def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def run_codexbar_cost(provider: str) -> List[Dict[str, Any]]:
+def run_codexbar_cost(provider: str, days: Optional[int] = None) -> List[Dict[str, Any]]:
     cmd = ["codexbar", "cost", "--format", "json", "--provider", provider]
+    if days is not None:
+        cmd.extend(["--days", str(days)])
     try:
         output = subprocess.check_output(cmd, text=True)
     except FileNotFoundError:
@@ -38,18 +50,22 @@ def run_codexbar_cost(provider: str) -> List[Dict[str, Any]]:
     return payload
 
 
-def load_payload(input_path: Optional[str], provider: str) -> Dict[str, Any]:
+def load_payload(
+    input_path: Optional[str], provider: str, days: Optional[int] = None
+) -> Dict[str, Any]:
     if input_path:
         if input_path == "-":
             raw = sys.stdin.read()
         else:
             with open(input_path, "r", encoding="utf-8") as handle:
                 raw = handle.read()
-        data = json.loads(raw)
+        data = json.loads(raw.removeprefix("\ufeff"))
     else:
-        data = run_codexbar_cost(provider)
+        data = run_codexbar_cost(provider, days)
 
     if isinstance(data, dict):
+        if data.get("provider", provider) != provider:
+            raise RuntimeError(f"Provider '{provider}' not found in codexbar payload.")
         return data
 
     if isinstance(data, list):
@@ -98,6 +114,30 @@ def filter_by_days(entries: List[Dict[str, Any]], days: Optional[int]) -> List[D
     return filtered
 
 
+def coerce_finite_cost(value: Any) -> Optional[float]:
+    """Coerce a cost field to a finite float, or None if it is not usable.
+
+    Accepts native numbers and numeric strings (for example "1.75"), since cost
+    payloads sometimes serialize numbers as strings. Rejects booleans (they are
+    ints in Python but never a valid cost) and non-finite values (NaN/Infinity),
+    which would otherwise silently corrupt aggregated totals.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
 def aggregate_costs(entries: Iterable[Dict[str, Any]]) -> Dict[str, float]:
     totals: Dict[str, float] = {}
     for entry in entries:
@@ -110,12 +150,12 @@ def aggregate_costs(entries: Iterable[Dict[str, Any]]) -> Dict[str, float]:
             if not isinstance(item, dict):
                 continue
             model = item.get("modelName")
-            cost = item.get("cost")
             if not isinstance(model, str):
                 continue
-            if not isinstance(cost, (int, float)):
+            cost = coerce_finite_cost(item.get("cost"))
+            if cost is None:
                 continue
-            totals[model] = totals.get(model, 0.0) + float(cost)
+            totals[model] = totals.get(model, 0.0) + cost
     return totals
 
 
@@ -134,9 +174,9 @@ def pick_current_model(entries: List[Dict[str, Any]]) -> Tuple[Optional[str], Op
                 if not isinstance(item, dict):
                     continue
                 model = item.get("modelName")
-                cost = item.get("cost")
-                if isinstance(model, str) and isinstance(cost, (int, float)):
-                    scored.append(ModelCost(model=model, cost=float(cost)))
+                cost = coerce_finite_cost(item.get("cost"))
+                if isinstance(model, str) and cost is not None:
+                    scored.append(ModelCost(model=model, cost=cost))
             if scored:
                 scored.sort(key=lambda item: item.cost, reverse=True)
                 return scored[0].model, entry.get("date") if isinstance(entry.get("date"), str) else None
@@ -169,9 +209,9 @@ def latest_day_cost(entries: List[Dict[str, Any]], model: str) -> Tuple[Optional
             if not isinstance(item, dict):
                 continue
             if item.get("modelName") == model:
-                cost = item.get("cost") if isinstance(item.get("cost"), (int, float)) else None
+                cost = coerce_finite_cost(item.get("cost"))
                 day = entry.get("date") if isinstance(entry.get("date"), str) else None
-                return day, float(cost) if cost is not None else None
+                return day, cost
     return None, None
 
 
@@ -239,14 +279,14 @@ def main() -> int:
     parser.add_argument("--mode", choices=["current", "all"], default="current")
     parser.add_argument("--model", help="Explicit model name to report instead of auto-current.")
     parser.add_argument("--input", help="Path to codexbar cost JSON (or '-' for stdin).")
-    parser.add_argument("--days", type=int, help="Limit to last N days (based on daily rows).")
+    parser.add_argument("--days", type=positive_int, help="Limit to last N days (based on daily rows).")
     parser.add_argument("--format", choices=["text", "json"], default="text")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
 
     args = parser.parse_args()
 
     try:
-        payload = load_payload(args.input, args.provider)
+        payload = load_payload(args.input, args.provider, args.days)
     except Exception as exc:
         eprint(str(exc))
         return 1

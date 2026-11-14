@@ -1,11 +1,13 @@
-import { formatAge } from "../infra/channel-summary.js";
-import { formatTokenCount } from "../utils/usage-format.js";
+import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
+import { formatTokenCount } from "../utils/token-format.js";
 import { formatContextUsageLine } from "./tui-formatters.js";
 import type { GatewayStatusSummary } from "./tui-types.js";
 
 export function formatStatusSummary(summary: GatewayStatusSummary) {
-  const lines: string[] = [];
-  lines.push("Gateway status");
+  const lines = ["Gateway status"];
+  if (summary.runtimeVersion) {
+    lines.push(`Version: ${summary.runtimeVersion}`);
+  }
 
   if (!summary.linkChannel) {
     lines.push("Link channel: unknown");
@@ -14,16 +16,15 @@ export function formatStatusSummary(summary: GatewayStatusSummary) {
     const linked = summary.linkChannel.linked === true;
     const authAge =
       linked && typeof summary.linkChannel.authAgeMs === "number"
-        ? ` (last refreshed ${formatAge(summary.linkChannel.authAgeMs)})`
+        ? ` (last refreshed ${formatTimeAgo(summary.linkChannel.authAgeMs)})`
         : "";
     lines.push(`${linkLabel}: ${linked ? "linked" : "not linked"}${authAge}`);
   }
 
-  const providerSummary = Array.isArray(summary.providerSummary) ? summary.providerSummary : [];
-  if (providerSummary.length > 0) {
-    lines.push("");
-    lines.push("System:");
-    for (const line of providerSummary) {
+  const channelSummary = Array.isArray(summary.channelSummary) ? summary.channelSummary : [];
+  if (channelSummary.length > 0) {
+    lines.push("", "System:");
+    for (const line of channelSummary) {
       lines.push(`  ${line}`);
     }
   }
@@ -32,11 +33,12 @@ export function formatStatusSummary(summary: GatewayStatusSummary) {
   if (heartbeatAgents.length > 0) {
     const heartbeatParts = heartbeatAgents.map((agent) => {
       const agentId = agent.agentId ?? "unknown";
-      if (!agent.enabled || !agent.everyMs) return `disabled (${agentId})`;
+      if (!agent.enabled || !agent.everyMs) {
+        return `disabled (${agentId})`;
+      }
       return `${agent.every ?? "unknown"} (${agentId})`;
     });
-    lines.push("");
-    lines.push(`Heartbeat: ${heartbeatParts.join(", ")}`);
+    lines.push("", `Heartbeat: ${heartbeatParts.join(", ")}`);
   }
 
   const sessionPaths = summary.sessions?.paths ?? [];
@@ -55,13 +57,14 @@ export function formatStatusSummary(summary: GatewayStatusSummary) {
   lines.push(`Default model: ${defaultModel}${defaultCtx}`);
 
   const sessionCount = summary.sessions?.count ?? 0;
-  lines.push(`Active sessions: ${sessionCount}`);
+  lines.push(`Stored sessions: ${sessionCount}`);
 
   const recent = Array.isArray(summary.sessions?.recent) ? summary.sessions?.recent : [];
   if (recent.length > 0) {
     lines.push("Recent sessions:");
     for (const entry of recent) {
-      const ageLabel = typeof entry.age === "number" ? formatAge(entry.age) : "no activity";
+      // Keep each recent session on one scan-friendly line for narrow terminal output.
+      const ageLabel = typeof entry.age === "number" ? formatTimeAgo(entry.age) : "no activity";
       const model = entry.model ?? "unknown";
       const usage = formatContextUsageLine({
         total: entry.totalTokens ?? null,

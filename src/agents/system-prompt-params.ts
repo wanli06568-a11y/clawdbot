@@ -1,105 +1,110 @@
-import fs from "node:fs";
+/**
+ * System prompt runtime parameter resolver.
+ *
+ * Collects repository, channel, and shell facts for prompt rendering.
+ */
 import path from "node:path";
-
-import type { ClawdbotConfig } from "../config/config.js";
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import type { ChatType } from "../channels/chat-type.js";
+import { resolveControlUiPublicSessionUrl } from "../config/control-ui-link-base.js";
+import type { InternalSessionEntry } from "../config/sessions/types.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
-  formatUserTime,
-  resolveUserTimeFormat,
-  resolveUserTimezone,
-  type ResolvedTimeFormat,
-} from "./date-time.js";
+  formatActiveNodeContextLabel,
+  getActiveNodeIdentityScope,
+  getCurrentActiveNodeContext,
+} from "../infra/active-node-context.js";
+import { findGitRootAsync } from "../infra/git-root.js";
+import { safeStat } from "../infra/path-existence.js";
+import { parseCronRunScopeSuffix } from "../sessions/session-key-utils.js";
+import { resolveAgentIdentity } from "./identity.js";
+import { sanitizeForPromptLiteral } from "./sanitize-for-prompt.js";
+import type { SystemPromptRuntimeInfo } from "./system-prompt.types.js";
 
-export type RuntimeInfoInput = {
-  agentId?: string;
-  host: string;
-  os: string;
-  arch: string;
-  node: string;
-  model: string;
-  defaultModel?: string;
-  channel?: string;
-  capabilities?: string[];
-  /** Supported message actions for the current channel (e.g., react, edit, unsend) */
-  channelActions?: string[];
-  repoRoot?: string;
-};
+const MAX_RUNTIME_AGENT_NAME_CHARS = 128;
 
-export type SystemPromptRuntimeParams = {
-  runtimeInfo: RuntimeInfoInput;
-  userTimezone: string;
-  userTime?: string;
-  userTimeFormat?: ResolvedTimeFormat;
-};
+type RuntimeInfoInput = Omit<SystemPromptRuntimeInfo, "chatType"> &
+  Required<Pick<SystemPromptRuntimeInfo, "host" | "os" | "arch" | "node" | "model">> & {
+    chatType?: ChatType;
+  };
 
 export function buildSystemPromptParams(params: {
-  config?: ClawdbotConfig;
+  config?: OpenClawConfig;
   agentId?: string;
-  runtime: Omit<RuntimeInfoInput, "agentId">;
+  runtime: Omit<RuntimeInfoInput, "agentId" | "agentName" | "sessionUrl" | "gitCoauthorPrompt">;
   workspaceDir?: string;
   cwd?: string;
-}): SystemPromptRuntimeParams {
-  const repoRoot = resolveRepoRoot({
-    config: params.config,
-    workspaceDir: params.workspaceDir,
-    cwd: params.cwd,
-  });
-  const userTimezone = resolveUserTimezone(params.config?.agents?.defaults?.userTimezone);
-  const userTimeFormat = resolveUserTimeFormat(params.config?.agents?.defaults?.timeFormat);
-  const userTime = formatUserTime(new Date(), userTimezone, userTimeFormat);
+  preparedRepoRoot?: string | null;
+  preparedGitCoauthorPrompt?: string | null;
+  preparedSessionEntry?: InternalSessionEntry;
+  requesterProfileId?: string;
+}): {
+  runtimeInfo: RuntimeInfoInput;
+} {
+  const repoRoot = params.preparedRepoRoot ?? undefined;
+  const { runId } = parseCronRunScopeSuffix(params.runtime.sessionKey);
+  // Exact isolated-cron URLs expose a volatile run id before prompt rendering can normalize it,
+  // defeating byte-identical prompt-prefix reuse across runs of the same job.
+  const sessionUrl =
+    runId === undefined
+      ? resolveControlUiPublicSessionUrl(params.config, {
+          sessionKey: params.runtime.sessionKey,
+          agentId: params.agentId,
+          sessionId: params.runtime.sessionId,
+          entry: params.preparedSessionEntry,
+        })
+      : undefined;
   return {
     runtimeInfo: {
       agentId: params.agentId,
+      agentName:
+        params.config && params.agentId
+          ? resolveRuntimeAgentName(params.config, params.agentId)
+          : undefined,
       ...params.runtime,
+      gitCoauthorPrompt: params.preparedGitCoauthorPrompt ?? undefined,
+      sessionUrl,
+      activeNode: formatActiveNodeContextLabel(
+        getCurrentActiveNodeContext(params.requesterProfileId),
+      ),
+      activeNodeIdentity: getActiveNodeIdentityScope(params.requesterProfileId),
       repoRoot,
     },
-    userTimezone,
-    userTime,
-    userTimeFormat,
   };
 }
 
-function resolveRepoRoot(params: {
-  config?: ClawdbotConfig;
+export function resolveRuntimeAgentName(config: OpenClawConfig, agentId: string) {
+  const name = sanitizeForPromptLiteral(resolveAgentIdentity(config, agentId)?.name ?? "").trim();
+  const bounded = truncateUtf16Safe(name, MAX_RUNTIME_AGENT_NAME_CHARS).trimEnd();
+  return bounded && bounded !== agentId ? bounded : undefined;
+}
+
+export async function resolveSystemPromptRepoRoot(params: {
+  config?: OpenClawConfig;
   workspaceDir?: string;
   cwd?: string;
-}): string | undefined {
+}): Promise<string | undefined> {
   const configured = params.config?.agents?.defaults?.repoRoot?.trim();
   if (configured) {
-    try {
-      const resolved = path.resolve(configured);
-      const stat = fs.statSync(resolved);
-      if (stat.isDirectory()) return resolved;
-    } catch {
-      // ignore invalid config path
+    const resolved = path.resolve(configured);
+    const stat = await safeStat(resolved);
+    if (stat?.isDirectory()) {
+      return resolved;
     }
   }
-  const candidates = [params.workspaceDir, params.cwd]
-    .map((value) => value?.trim())
-    .filter(Boolean) as string[];
+  const candidates = normalizeStringEntries([params.workspaceDir ?? "", params.cwd ?? ""]);
   const seen = new Set<string>();
   for (const candidate of candidates) {
     const resolved = path.resolve(candidate);
-    if (seen.has(resolved)) continue;
+    if (seen.has(resolved)) {
+      continue;
+    }
     seen.add(resolved);
-    const root = findGitRoot(resolved);
-    if (root) return root;
+    const root = await findGitRootAsync(resolved);
+    if (root) {
+      return root;
+    }
   }
   return undefined;
-}
-
-function findGitRoot(startDir: string): string | null {
-  let current = path.resolve(startDir);
-  for (let i = 0; i < 12; i += 1) {
-    const gitPath = path.join(current, ".git");
-    try {
-      const stat = fs.statSync(gitPath);
-      if (stat.isDirectory() || stat.isFile()) return current;
-    } catch {
-      // ignore missing .git at this level
-    }
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  return null;
 }

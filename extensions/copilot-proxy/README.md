@@ -1,13 +1,13 @@
-# Copilot Proxy (Clawdbot plugin)
+# Copilot Proxy (OpenClaw plugin)
 
 Provider plugin for the **Copilot Proxy** VS Code extension.
 
 ## Enable
 
-Bundled plugins are disabled by default. Enable this one:
+This bundled plugin is enabled by default. If you previously disabled it, re-enable it:
 
 ```bash
-clawdbot plugins enable copilot-proxy
+openclaw plugins enable copilot-proxy
 ```
 
 Restart the Gateway after enabling.
@@ -15,7 +15,7 @@ Restart the Gateway after enabling.
 ## Authenticate
 
 ```bash
-clawdbot models auth login --provider copilot-proxy --set-default
+openclaw models auth login --provider copilot-proxy --set-default
 ```
 
 ## Notes

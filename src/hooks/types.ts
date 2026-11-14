@@ -1,3 +1,5 @@
+import type { RequirementsMetadata } from "../shared/requirements.js";
+
 export type HookInstallSpec = {
   id?: string;
   kind: "bundled" | "npm" | "git";
@@ -7,7 +9,7 @@ export type HookInstallSpec = {
   bins?: string[];
 };
 
-export type ClawdbotHookMetadata = {
+export type OpenClawHookMetadata = RequirementsMetadata & {
   always?: boolean;
   hookKey?: string;
   emoji?: string;
@@ -16,18 +18,7 @@ export type ClawdbotHookMetadata = {
   events: string[];
   /** Optional export name (default: "default") */
   export?: string;
-  os?: string[];
-  requires?: {
-    bins?: string[];
-    anyBins?: string[];
-    env?: string[];
-    config?: string[];
-  };
   install?: HookInstallSpec[];
-};
-
-export type HookInvocationPolicy = {
-  enabled: boolean;
 };
 
 export type ParsedHookFrontmatter = Record<string, string>;
@@ -35,7 +26,7 @@ export type ParsedHookFrontmatter = Record<string, string>;
 export type Hook = {
   name: string;
   description: string;
-  source: "clawdbot-bundled" | "clawdbot-managed" | "clawdbot-workspace" | "clawdbot-plugin";
+  source: "openclaw-bundled" | "openclaw-managed" | "openclaw-workspace" | "openclaw-plugin";
   pluginId?: string;
   filePath: string; // Path to HOOK.md
   baseDir: string; // Directory containing hook
@@ -47,21 +38,10 @@ export type HookSource = Hook["source"];
 export type HookEntry = {
   hook: Hook;
   frontmatter: ParsedHookFrontmatter;
-  clawdbot?: ClawdbotHookMetadata;
-  invocation?: HookInvocationPolicy;
+  metadata?: OpenClawHookMetadata;
+  invocation?: { enabled: boolean };
 };
 
-export type HookEligibilityContext = {
-  remote?: {
-    platforms: string[];
-    hasBin: (bin: string) => boolean;
-    hasAnyBin: (bins: string[]) => boolean;
-    note?: string;
-  };
-};
-
-export type HookSnapshot = {
-  hooks: Array<{ name: string; events: string[] }>;
-  resolvedHooks?: Hook[];
-  version?: number;
+export type HookPolicyEntry = Pick<HookEntry, "metadata"> & {
+  hook: Pick<Hook, "name" | "source">;
 };

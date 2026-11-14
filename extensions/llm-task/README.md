@@ -4,11 +4,11 @@ Adds an **optional** agent tool `llm-task` for running **JSON-only** LLM tasks
 (drafting, summarizing, classifying) with optional JSON Schema validation.
 
 Designed to be called from workflow engines (for example, Lobster via
-`clawd.invoke --each`) without adding new Clawdbot code per workflow.
+`openclaw.invoke --each`) without adding new OpenClaw code per workflow.
 
 ## Enable
 
-1) Enable the plugin:
+1. Enable the plugin:
 
 ```json
 {
@@ -20,7 +20,7 @@ Designed to be called from workflow engines (for example, Lobster via
 }
 ```
 
-2) Allowlist the tool (it is registered with `optional: true`):
+2. Allowlist the tool (it is registered with `optional: true`):
 
 ```json
 {
@@ -43,11 +43,15 @@ Designed to be called from workflow engines (for example, Lobster via
     "entries": {
       "llm-task": {
         "enabled": true,
+        "llm": {
+          "allowModelOverride": true,
+          "allowedCompletionModels": ["openai/gpt-6-astra"],
+          "allowAuthProfileOverride": true
+        },
         "config": {
-          "defaultProvider": "openai-codex",
-          "defaultModel": "gpt-5.2",
+          "defaultProvider": "openai",
+          "defaultModel": "gpt-6-astra",
           "defaultAuthProfileId": "main",
-          "allowedModels": ["openai-codex/gpt-5.2"],
           "maxTokens": 800,
           "timeoutMs": 30000
         }
@@ -57,8 +61,11 @@ Designed to be called from workflow engines (for example, Lobster via
 }
 ```
 
-`allowedModels` is an allowlist of `provider/model` strings. If set, any request
-outside the list is rejected.
+The host-owned `llm` policy authorizes model/profile overrides. Its
+`allowedCompletionModels` restricts every completion, including the resolved agent
+default. Run `openclaw doctor --fix` once for entries created by older releases;
+Doctor grants the shipped selection permissions and moves legacy
+`config.allowedModels` values into `llm.allowedCompletionModels` without widening them.
 
 ## Tool API
 
@@ -69,6 +76,7 @@ outside the list is rejected.
 - `schema` (object, optional JSON Schema)
 - `provider` (string, optional)
 - `model` (string, optional)
+- `thinking` (string, optional)
 - `authProfileId` (string, optional)
 - `temperature` (number, optional)
 - `maxTokens` (number, optional)
@@ -78,6 +86,13 @@ outside the list is rejected.
 
 Returns `details.json` containing the parsed JSON (and validates against
 `schema` when provided).
+
+When the selected isolated runtime supports native structured output, the same
+schema also constrains generation. Codex retries with a prompt-level constraint
+when it explicitly rejects the schema dialect; local validation remains the
+final result check. OpenClaw forwards the schema by reference when its JSON
+encoding fits within 1 KiB; other schemas are not forwarded natively. Callers
+must not mutate the schema after handoff.
 
 ## Notes
 
@@ -89,9 +104,9 @@ Returns `details.json` containing the parsed JSON (and validates against
 
 ## Bundled extension note
 
-This extension depends on Clawdbot internal modules (the embedded agent runner).
-It is intended to ship as a **bundled** Clawdbot extension (like `lobster`) and
+This extension depends on OpenClaw internal modules (the embedded agent runner).
+It is intended to ship as a **bundled** OpenClaw extension (like `lobster`) and
 be enabled via `plugins.entries` + tool allowlists.
 
 It is **not** currently designed to be copied into
-`~/.clawdbot/extensions` as a standalone plugin directory.
+`~/.openclaw/extensions` as a standalone plugin directory.
